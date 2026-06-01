@@ -15,6 +15,7 @@ Skeleton colours:
 Run face_register.py first to register your face.
 """
 
+import argparse
 import cv2
 import time
 import queue
@@ -93,8 +94,19 @@ gesture_model = load_model(GESTURE_MODEL_PATH)
 gesture_model(np.zeros((1, 63), dtype=np.float32), training=False)
 print(f"Gesture model loaded — {gesture_model.output_shape[-1]} classes")
 
+# ── Parse logged-in user from login_system.py ────────────────────────────────
+_arg_parser = argparse.ArgumentParser()
+_arg_parser.add_argument("--user", type=str, default=None,
+                         help="Username of the logged-in user (set by login_system.py)")
+_args      = _arg_parser.parse_args()
+ACTIVE_USER = _args.user
+if ACTIVE_USER:
+    print(f"Active session for user: {ACTIVE_USER}")
+else:
+    print("WARNING: no --user passed. Run login_system.py instead of main.py directly.")
+
 # ── Face recognizer ───────────────────────────────────────────────────────────
-face_rec       = FaceRecognizer()
+face_rec       = FaceRecognizer(active_user=ACTIVE_USER)
 num_registered = len(face_rec.face_db)
 
 # ── MediaPipe landmarkers ─────────────────────────────────────────────────────
