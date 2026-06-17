@@ -25,6 +25,7 @@ import cv2
 import mediapipe as mp
 from mediapipe.tasks.python import vision
 from mediapipe.tasks.python.core.base_options import BaseOptions
+from camera_utils import open_camera, read_frame, close_camera
 
 
 # =========================================================
@@ -211,10 +212,7 @@ def capture_face_for_user(target_username):
     )
     landmarker = vision.FaceLandmarker.create_from_options(options)
 
-    cap = cv2.VideoCapture(0)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
+    cap = open_camera(width=640, height=480)
 
     start_time        = time.perf_counter()
     sample_embeddings = []
@@ -226,13 +224,12 @@ def capture_face_for_user(target_username):
     print("Hold SPACE to capture 60 frames.  Q to cancel.")
 
     while True:
-        success, frame = cap.read()
-        if not success:
+        frame = read_frame(cap)
+        if frame is None:
             break
-
-        frame  = np.ascontiguousarray(frame[:, ::-1, :])    # mirror
+        frame  = cv2.flip(frame, 1)        # mirror
         h, w   = frame.shape[:2]
-        rgb    = np.ascontiguousarray(frame[:, :, ::-1])
+        rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)   # BGR → RGB for MediaPipe
         mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         ts_ms  = int((time.perf_counter() - start_time) * 1000)
         result = landmarker.detect_for_video(mp_img, ts_ms)
@@ -300,7 +297,7 @@ def capture_face_for_user(target_username):
     else:
         print("No samples collected - nothing saved.")
 
-    cap.release()
+    close_camera(cap)
     cv2.destroyAllWindows()
     landmarker.close()
     return saved
