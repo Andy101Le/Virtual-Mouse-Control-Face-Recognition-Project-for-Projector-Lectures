@@ -6,7 +6,6 @@ import os
 import time
 from mediapipe.tasks.python import vision
 from mediapipe.tasks.python.core.base_options import BaseOptions
-from camera_utils import open_camera, read_frame, close_camera
 
 GESTURES             = ["MOVE", "LEFT CLICK", "RIGHT CLICK", "ZOOM IN", "ZOOM OUT"]
 CSV_FILE             = "landmark_dataset.csv"
@@ -24,7 +23,10 @@ options = vision.HandLandmarkerOptions(
     num_hands=1)
 landmarker = vision.HandLandmarker.create_from_options(options)
 
-cap = open_camera(width=640, height=480)
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
 
 t0 = time.perf_counter()
 current_gesture = 0
@@ -40,14 +42,14 @@ print("Gesture 1/%d: %s" % (len(GESTURES), GESTURES[0]))
 
 while current_gesture < len(GESTURES):
     gesture_name = GESTURES[current_gesture]
-    frame = read_frame(cap)
-    if frame is None:
+    ret, frame = cap.read()
+    if not ret:
         break
 
     frame = cv2.flip(frame, 1)
     h, w  = frame.shape[:2]
 
-    rgb      = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)  # BGR frame → RGB for MediaPipe
+    rgb      = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
     ts       = int((time.perf_counter() - t0) * 1000)
     results  = landmarker.detect_for_video(mp_image, ts)
@@ -118,7 +120,7 @@ while current_gesture < len(GESTURES):
     elif key == ord("q"):
         break
 
-close_camera(cap)
+cap.release()
 cv2.destroyAllWindows()
 landmarker.close()
 print("Collection complete. Run train_gesture_model.py to train the model.")

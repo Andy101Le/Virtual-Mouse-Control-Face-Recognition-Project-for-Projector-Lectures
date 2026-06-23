@@ -2,10 +2,10 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report
-from keras.models import Sequential
-from keras.layers import Dense, Dropout, BatchNormalization
-from keras.callbacks import EarlyStopping, ReduceLROnPlateau
-from keras.regularizers import l2
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Dropout, BatchNormalization
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.regularizers import l2
 import os
 
 GESTURES     = ["MOVE", "LEFT CLICK", "RIGHT CLICK", "ZOOM IN", "ZOOM OUT"]
@@ -63,5 +63,5 @@ print("Validation loss:     %.4f"   % val_loss)
 y_pred = np.argmax(model.predict(X_val, verbose=0), axis=1)
 print(classification_report(y_val, y_pred, target_names=GESTURES))
 
-model.save(MODEL_SAVE, save_format="h5")
+model.save(MODEL_SAVE)
 print("Model saved -> %s" % MODEL_SAVE)

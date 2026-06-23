@@ -25,11 +25,10 @@ import numpy as np
 import mediapipe as mp
 from mediapipe.tasks.python import vision
 from mediapipe.tasks.python.core.base_options import BaseOptions
-from keras.models import load_model
+from tensorflow.keras.models import load_model
 import pyautogui
-from camera_utils import open_camera, read_frame, close_camera
 
-from vm_face_recognizer import FaceRecognizer, UNKNOWN_LABEL
+from face_recognizer import FaceRecognizer, UNKNOWN_LABEL
 
 pyautogui.FAILSAFE = False
 pyautogui.PAUSE    = 0
@@ -151,8 +150,12 @@ if os.path.exists(POSE_TASK_PATH):
 else:
     print("pose_landmarker.task not found — body skeleton disabled.")
 
-# ── Camera (cross-platform: Picamera2 on Pi, cv2.VideoCapture on Windows) ────
-cap = open_camera(width=640, height=480)
+# ── Webcam ────────────────────────────────────────────────────────────────────
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+cap.set(cv2.CAP_PROP_FPS,          30)
+cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
 start_time = time.perf_counter()
 
 # ── Runtime state ─────────────────────────────────────────────────────────────
@@ -240,13 +243,13 @@ def draw_pose_skeleton(frame, pose_lms, color, w, h, label=None, scores=None):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1, cv2.LINE_AA)
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
-while True:
-    frame = read_frame(cap)
-    if frame is None:
+while cap.isOpened():
+    success, frame = cap.read()
+    if not success:
         break
 
     _frame_n += 1
-    frame = cv2.flip(frame, 1)  # mirror horizontally
+    frame = np.ascontiguousarray(frame[:, ::-1, :])
 
     now_t     = time.perf_counter()
     dt        = now_t - prev_time
@@ -255,7 +258,7 @@ while True:
         fps = 0.9 * fps + 0.1 / dt
 
     h, w  = frame.shape[:2]
-    rgb_c = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)   # contiguous RGB for MediaPipe
+    rgb_c = np.ascontiguousarray(frame[:, :, ::-1])
     ts_ms = int((now_t - start_time) * 1000)
 
     # ── Face detection (every FACE_DETECT_INTERVAL frames) ───────────────────
@@ -476,7 +479,7 @@ while True:
     if cv2.waitKey(1) & 0xFF == ord("q"):
         break
 
-close_camera(cap)
+cap.release()
 cv2.destroyAllWindows()
 hand_landmarker.close()
 if face_landmarker: face_landmarker.close()

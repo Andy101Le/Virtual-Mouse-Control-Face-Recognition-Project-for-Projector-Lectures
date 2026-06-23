@@ -22,7 +22,6 @@ import numpy as np
 import mediapipe as mp
 from mediapipe.tasks.python import vision
 from mediapipe.tasks.python.core.base_options import BaseOptions
-from camera_utils import open_camera, read_frame, close_camera
 
 FACE_TASK_PATH  = "face_landmarker.task"   # download from MediaPipe model zoo
 FACES_DB_PATH   = "faces.pkl"
@@ -62,7 +61,10 @@ cascade = cv2.CascadeClassifier(
     cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
 )
 
-cap = open_camera(width=640, height=480)
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 start_time = time.perf_counter()
 
 def extract_embedding(face_landmarks):
@@ -101,16 +103,14 @@ print("Look at the camera, then hold SPACE to capture 60 frames.")
 print("Try turning your head slightly left/right/up/down for variety.\n")
 
 while True:
-    rgb_raw = read_frame(cap)
-    frame   = rgb_raw
-    success = frame is not None
+    success, frame = cap.read()
     if not success:
         break
 
-    frame   = cv2.flip(frame, 1)           # mirror horizontally
+    frame   = np.ascontiguousarray(frame[:, ::-1, :])   # flip horizontal (mirror, contiguous for cv2)
     h, w    = frame.shape[:2]
-    rgb     = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)   # BGR → RGB for MediaPipe
-    mp_img  = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+    rgb     = frame[:, :, ::-1]   # BGR→RGB (zero-copy view)
+    mp_img  = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb))
     ts_ms   = int((time.perf_counter() - start_time) * 1000)
     results = landmarker.detect_for_video(mp_img, ts_ms)
 
@@ -183,6 +183,6 @@ if sample_embeddings:
 else:
     print("\nNo samples collected — nothing saved.")
 
-close_camera(cap)
+cap.release()
 cv2.destroyAllWindows()
 landmarker.close()
