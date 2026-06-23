@@ -25,13 +25,14 @@ import numpy as np
 import mediapipe as mp
 from mediapipe.tasks.python import vision
 from mediapipe.tasks.python.core.base_options import BaseOptions
-from tensorflow.keras.models import load_model
+from keras.models import load_model
 import pyautogui
 
 from face_recognizer import FaceRecognizer, UNKNOWN_LABEL
 
 pyautogui.FAILSAFE = False
 pyautogui.PAUSE    = 0
+smallView = False
 
 # ── Model paths ───────────────────────────────────────────────────────────────
 HAND_TASK_PATH     = "hand_landmarker.task"
@@ -150,12 +151,34 @@ if os.path.exists(POSE_TASK_PATH):
 else:
     print("pose_landmarker.task not found — body skeleton disabled.")
 
-# ── Webcam ────────────────────────────────────────────────────────────────────
-cap = cv2.VideoCapture(0)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-cap.set(cv2.CAP_PROP_FPS,          30)
-cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
+# ── Camera ───────────────────────────────────────────────────────────────────
+try:
+    from picamera2 import Picamera2
+    _HAS_PICAMERA2 = True
+except ImportError:
+    _HAS_PICAMERA2 = False
+
+if _HAS_PICAMERA2:
+    _picam = Picamera2()
+    _picam.configure(_picam.create_video_configuration(
+        main={"size": (640, 480), "format": "RGB888"}))
+    _picam.start()
+
+    class _RPiCap:
+        def isOpened(self): return True
+        def read(self):     return True, _picam.capture_array()
+        def release(self):  _picam.stop()
+
+    cap = _RPiCap()
+    print("Camera: RPi CSI (picamera2)")
+else:
+    cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    cap.set(cv2.CAP_PROP_FPS,          30)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
+    print("Camera: USB webcam (cv2)")
+
 start_time = time.perf_counter()
 
 # ── Runtime state ─────────────────────────────────────────────────────────────
@@ -249,7 +272,7 @@ while cap.isOpened():
         break
 
     _frame_n += 1
-    frame = np.ascontiguousarray(frame[:, ::-1, :])
+    frame = cv2.flip(frame, 1)  # mirror horizontally
 
     now_t     = time.perf_counter()
     dt        = now_t - prev_time
@@ -258,7 +281,7 @@ while cap.isOpened():
         fps = 0.9 * fps + 0.1 / dt
 
     h, w  = frame.shape[:2]
-    rgb_c = np.ascontiguousarray(frame[:, :, ::-1])
+    rgb_c = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)   # contiguous RGB for MediaPipe
     ts_ms = int((now_t - start_time) * 1000)
 
     # ── Face detection (every FACE_DETECT_INTERVAL frames) ───────────────────
@@ -475,7 +498,11 @@ while cap.isOpened():
     cv2.putText(frame, banner_txt, (10,h-27),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.60, banner_col, 2, cv2.LINE_AA)
 
-    cv2.imshow("Multi-Person Limb Gesture Control", frame)
+    small = cv2.resize(frame, (100, 100))
+    if smallView:
+        cv2.imshow("Multi-Person Limb Gesture Control", small)
+    else:
+        cv2.imshow("Multi-Person Limb Gesture Control", frame)
     if cv2.waitKey(1) & 0xFF == ord("q"):
         break
 
