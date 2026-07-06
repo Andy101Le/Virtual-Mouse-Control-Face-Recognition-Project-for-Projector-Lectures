@@ -29,6 +29,7 @@ from keras.models import load_model
 import pyautogui
 
 from face_recognizer import FaceRecognizer, UNKNOWN_LABEL
+from ptz_controller import PTZController
 
 pyautogui.FAILSAFE = False
 pyautogui.PAUSE    = 0
@@ -109,6 +110,8 @@ else:
 # ── Face recognizer ───────────────────────────────────────────────────────────
 face_rec       = FaceRecognizer(active_user=ACTIVE_USER)
 num_registered = len(face_rec.face_db)
+
+ptz = PTZController(active_user=ACTIVE_USER)
 
 # ── MediaPipe landmarkers ─────────────────────────────────────────────────────
 hand_landmarker = vision.HandLandmarker.create_from_options(
@@ -319,24 +322,38 @@ while cap.isOpened():
 
                 limb_mode = user_active
 
-    # Draw cached face boxes
-    for fi, face_lms in enumerate(cached_face_lms):
-        nose   = face_rec.get_nose_tip(face_lms)
-        pts_px = np.array([[int(lm.x*w), int(lm.y*h)] for lm in face_lms], dtype=np.int32)
-        xs, ys  = pts_px[:,0], pts_px[:,1]
-        box_col = (0,220,0) if (fi==0 and recognised_user != UNKNOWN_LABEL) else (0,0,200)
-        cv2.rectangle(frame,
-                      (max(xs.min()-10,0), max(ys.min()-10,0)),
-                      (min(xs.max()+10,w), min(ys.max()+10,h)),
-                      box_col, 2)
-        cv2.circle(frame, (int(nose[0]*w), int(nose[1]*h)), 5, (0,255,255), -1)
-
     # ── Pose detection (every POSE_DETECT_INTERVAL frames) ───────────────────
     if pose_landmarker is not None and _frame_n % POSE_DETECT_INTERVAL == 0:
         p_result        = pose_landmarker.detect_for_video(
             mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_c), ts_ms)
         cached_pose_lms = p_result.pose_landmarks
         num_people      = len(cached_pose_lms)
+
+    # ── PTZ tracking (drives the physical pan/tilt hardware) ─────────────────
+    ptz.update(
+        nose_pos=face_nose_pos,
+        recognised_user=recognised_user,
+        is_registered_face_visible=(user_active and recognised_user != UNKNOWN_LABEL),
+        pose_landmarks=cached_pose_lms,
+    )
+
+    # ── Hand detection (every frame) ──────────────────────────────────────────
+    h_result = hand_landmarker.detect_for_video(
+        mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_c), ts_ms)
+
+    # Draw cached face boxes
+    for fi, face_lms in enumerate(cached_face_lms):
+        xs = [lm.x for lm in face_lms]
+        ys = [lm.y for lm in face_lms]
+        pts_px = np.array([[int(x*w), int(y*h)] for x, y in zip(xs, ys)], dtype=np.int32)
+        xs_px, ys_px = pts_px[:,0], pts_px[:,1]
+        nose_x, nose_y = face_rec.get_nose_tip(face_lms)
+        box_col = (0,220,0) if (fi==0 and recognised_user != UNKNOWN_LABEL) else (0,0,200)
+        cv2.rectangle(frame,
+                      (max(xs_px.min()-10,0), max(ys_px.min()-10,0)),
+                      (min(xs_px.max()+10,w), min(ys_px.max()+10,h)),
+                      box_col, 2)
+        cv2.circle(frame, (int(nose_x*w), int(nose_y*h)), 5, (0,255,255), -1)
 
     # Draw cached pose skeletons
     for pi, pose_lms in enumerate(cached_pose_lms):
@@ -347,10 +364,6 @@ while cap.isOpened():
         above_txt  = "YOU" if is_reg else f"P{pi}:UNK"
         scores_txt = f"pca={recog_score:.3f}  geo={face_size:.3f}" if (is_reg and face_size) else None
         draw_pose_skeleton(frame, pose_lms, skel_col, w, h, above_txt, scores_txt)
-
-    # ── Hand detection (every frame) ─────────────────────────────────────────
-    h_result = hand_landmarker.detect_for_video(
-        mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_c), ts_ms)
 
     # Control zone
     mx, my   = int(CAM_MARGIN*w), int(CAM_MARGIN*h)
@@ -368,9 +381,7 @@ while cap.isOpened():
 
     if h_result.hand_landmarks:
         for hand_id, hand in enumerate(h_result.hand_landmarks):
-            wrist = np.array([hand[0].x, hand[0].y], dtype=np.float32)
-            hand_is_user = (user_active and face_nose_pos is not None and
-                            float(np.linalg.norm(wrist - face_nose_pos)) < 0.70)
+            wrist_raw = np.array([hand[0].x, hand[0].y], dtype=np.float32)
 
             if hand_id not in smoothed_xyz:
                 smoothed_xyz[hand_id]    = np.array([[lm.x,lm.y,lm.z] for lm in hand], dtype=np.float32)
@@ -380,7 +391,12 @@ while cap.isOpened():
             raw_pts = np.array([[lm.x,lm.y,lm.z] for lm in hand], dtype=np.float32)
             sxyz    = SMOOTHING_ALPHA * raw_pts + ONE_MINUS_ALPHA * smoothed_xyz[hand_id]
             smoothed_xyz[hand_id] = sxyz
-            sp = (sxyz[:,:2] * (w,h)).astype(np.int32)
+
+            sp    = (sxyz[:,:2] * (w,h)).astype(np.int32)
+            wrist = wrist_raw
+
+            hand_is_user = (user_active and face_nose_pos is not None and
+                            float(np.linalg.norm(wrist - face_nose_pos)) < 0.70)
 
             line_col = (255,0,0) if hand_is_user else (0,0,200)
             dot_col  = (0,255,0) if hand_is_user else (0,0,200)
@@ -498,6 +514,8 @@ while cap.isOpened():
     cv2.putText(frame, banner_txt, (10,h-27),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.60, banner_col, 2, cv2.LINE_AA)
 
+    ptz.draw_debug_hud(frame)
+
     small = cv2.resize(frame, (100, 100))
     if smallView:
         cv2.imshow("Multi-Person Limb Gesture Control", small)
@@ -511,3 +529,4 @@ cv2.destroyAllWindows()
 hand_landmarker.close()
 if face_landmarker: face_landmarker.close()
 if pose_landmarker: pose_landmarker.close()
+ptz.close()
