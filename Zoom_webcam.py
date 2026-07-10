@@ -1,143 +1,334 @@
+"""
+zoom_webcam.py
+───────────────
+Digital zoom/crop that keeps the tracked person framed, ported from the
+original standalone Zoom_webcam.py auto-zoom prototype into a reusable
+class main.py can call into.
+
+The core tracking math is UNCHANGED from the original script: same POSE
+landmark indices (face/shoulder/hip), same target-ratio + far-subject
+zoom boost, same independent zoom-in/zoom-out smoothing rates. What's
+different is the packaging — instead of running its own PoseLandmarker
+and camera capture loop, this takes the pose landmarks main.py's
+LandmarkPipeline already computes each frame, and exposes update()/
+apply() so main.py can drive it directly.
+
+ADDED vs. the original script: the original assumed a full-body framing
+(head down to hips always visible), which isn't realistic for a
+face/podium-level camera — hips are very often out of frame or low-
+confidence there, and the original code just froze at zoom=1.0 whenever
+hips weren't detected. This version degrades gracefully instead:
+  - hips visible      → original "waist-up" framing (unchanged math)
+  - only shoulders visible → "chest-up" framing, extrapolated from
+    head-to-shoulder distance
+  - only face visible → "face" framing, padded from face height
+draw_debug() also reproduces the zoom-level readout + tracked-region
+box the original script drew, so it's visible on screen whether/how
+much auto-zoom is active.
+
+Also added: a control-zone-aware zoom cap. This project uses the
+camera feed for two things at once — framing the shot, AND detecting
+hand gestures across CursorController's CAM_MARGIN control zone (the
+region the person's hand must be able to reach across to move the
+cursor). Those two purposes were fighting: without a cap, auto-zoom
+would happily crop in tighter than the control zone itself, so the
+user's outstretched arm would go off-screen even though it was still
+being tracked correctly by (un-cropped) hand detection. Pass
+control_zone_margin (CursorController.CAM_MARGIN) in and zoom will
+never crop past what that margin requires stay visible.
+
+This is a DISPLAY-ONLY effect: call update() with the tracked person's
+pose landmarks each frame, apply() right before cv2.imshow() to crop/
+rescale the frame, then draw_debug() on the result to overlay the
+zoom readout. Hand/gesture detection and cursor control keep running
+on the original, un-cropped frame — this class never touches that
+pipeline, so cursor accuracy is unaffected by zoom.
+"""
+
 import cv2
-import mediapipe as mp
-from mediapipe.tasks import python
-from mediapipe.tasks.python import vision
-import os
-import time
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-model_path = os.path.join(BASE_DIR, 'pose_landmarker_lite.task')
-
-latest_result = None
-
-def result_callback(result, output_image, timestamp_ms):
-    global latest_result
-    latest_result = result
-
-base_options = mp.tasks.BaseOptions(model_asset_path=model_path)
-options = vision.PoseLandmarkerOptions(
-    base_options=base_options,
-    running_mode=vision.RunningMode.LIVE_STREAM,
-    result_callback=result_callback
-)
-landmarker = vision.PoseLandmarker.create_from_options(options)
-
-cap = cv2.VideoCapture(0)
-
-zoom = 1.0
-crop_cx, crop_cy = None, None
-
-TARGET_RATIO = 0.80
-FAR_THRESH = 0.45
-FAR_BOOST = 0.18
-HEAD_PAD = 0.20
-HIP_PAD = 0.10
-ZOOM_IN_SMOOTH = 0.14
-ZOOM_OUT_SMOOTH = 0.07
-PAN_SMOOTH = 0.12
-MAX_ZOOM = 5.0
-VIS_THRESH = 0.5
+import numpy as np
 
 
-FACE_IDS = [0, 1, 2, 3, 4, 5, 6, 7, 8]
-SHOULDER_IDS = [11, 12]
-HIP_IDS = [23, 24]
+class ZoomWebcamController:
+    # ── Same tunables as the original Zoom_webcam.py ────────────────────────
+    TARGET_RATIO    = 0.80
+    FAR_THRESH      = 0.45
+    FAR_BOOST       = 0.18
+    HEAD_PAD        = 0.20
+    HIP_PAD         = 0.10
+    ZOOM_IN_SMOOTH  = 0.14
+    ZOOM_OUT_SMOOTH = 0.07
+    PAN_SMOOTH      = 0.12
+    MAX_ZOOM        = 2.5    # absolute ceiling, lowered from the original 5.0x
+                              # so a tight torso/face region alone can't zoom in
+                              # further than is comfortable for arm-reach gestures
+    VIS_THRESH      = 0.5
 
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
+    # ── Fallback framing when the original head-to-hip region isn't visible ─
+    CHEST_FALLBACK_RATIO = 1.6   # extend below shoulders by this multiple of
+                                 # head-to-shoulder distance ("chest-up")
+    FACE_FALLBACK_RATIO  = 3.0   # extend below the face by this multiple of
+                                 # face height, when even shoulders aren't seen
 
-    h, w = frame.shape[:2]
-    if crop_cx is None:
-        crop_cx, crop_cy = w / 2, h / 2
+    FACE_IDS     = [0, 1, 2, 3, 4, 5, 6, 7, 8]
+    SHOULDER_IDS = [11, 12]
+    HIP_IDS      = [23, 24]
 
-    timestamp_ms = int(time.time() * 1000)
+    def __init__(self, enabled=True, control_zone_margin=None):
+        self.enabled = enabled
+        self.zoom    = 1.0
+        self.crop_cx = None
+        self.crop_cy = None
 
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-    landmarker.detect_async(mp_image, timestamp_ms)
+        # If given the cursor control zone's margin (CursorController.CAM_MARGIN),
+        # cap zoom so the crop never excludes that zone — i.e. the person can
+        # always see their own hand across its full reachable range.
+        # margin=0.15 means the middle 70% of the frame is the control zone,
+        # so zoom must never exceed 1 / (1 - 2*margin) ≈ 1.43x.
+        #
+        # Known trade-off (kept intentionally): at that cap, crop size
+        # exactly equals the control zone's raw size, so the box necessarily
+        # fills the ENTIRE display — it can't be framed any tighter without
+        # cropping part of the reachable area out of view. Since normal
+        # working distance usually wants noticeably more zoom than 1.43x,
+        # the system saturates at the cap almost immediately and stays
+        # there — the control-zone box will visibly resize only when the
+        # person is far enough away that their natural framing zoom is
+        # itself below the cap (roughly: box grows from ~70% of the frame
+        # at zoom=1.0 up to 100% at zoom=cap, then stays pinned at 100%
+        # for anything closer). This is the correct, expected result of
+        # guaranteeing full arm-reach visibility — not a bug — but it does
+        # mean "dynamic-looking" resizing is mostly only visible from far
+        # away. To trade the guarantee for a wider visible dynamic range,
+        # raise MAX_ZOOM and pass control_zone_margin=None instead (the
+        # box will then resize more noticeably, but at high zoom part of
+        # it may be cropped out of view).
+        self.control_zone_margin = control_zone_margin
+        if control_zone_margin is not None and 0 < control_zone_margin < 0.5:
+            self.control_zone_zoom_cap = 1.0 / (1.0 - 2 * control_zone_margin)
+        else:
+            self.control_zone_zoom_cap = None
 
-    status = "No person detected"
-    frame_box = None
+        # Populated by update()/apply() for draw_debug() to visualise.
+        self.last_region    = None   # (rx1, top, rx2, bottom) in raw-frame px
+        self.last_mode      = None   # "torso" | "upper-body" | "face" | None
+        self.last_crop_rect = None   # (x1, y1, crop_w, crop_h) in raw-frame px
+        self.last_scale_x   = 1.0    # exact scale apply() last used (for transforms)
+        self.last_scale_y   = 1.0
 
-    if latest_result and latest_result.pose_landmarks:
-        lms = latest_result.pose_landmarks[0]
+    def toggle(self):
+        self.enabled = not self.enabled
+        return self.enabled
 
-        def pts(ids):
-            return [(lms[i].x * w, lms[i].y * h) for i in ids
-                    if lms[i].visibility > VIS_THRESH]
+    @classmethod
+    def _pts(cls, pose_landmarks, ids, w, h):
+        return [(pose_landmarks[i].x * w, pose_landmarks[i].y * h)
+                for i in ids if pose_landmarks[i].visibility > cls.VIS_THRESH]
 
-        face = pts(FACE_IDS)
-        shoulders = pts(SHOULDER_IDS)
-        hips = pts(HIP_IDS)
+    def update(self, pose_landmarks, w, h):
+        """
+        pose_landmarks: the tracked person's 33-point MediaPipe pose
+        landmarks, or None if they're not currently visible/recognised.
+        Called every frame; smoothly relaxes back to zoom=1.0 (full
+        frame) when nobody is tracked.
+        """
+        if self.crop_cx is None:
+            self.crop_cx, self.crop_cy = w / 2.0, h / 2.0
 
-        if face and hips:
-            head_y = min(p[1] for p in face)
-            hip_y = sum(p[1] for p in hips) / len(hips)
+        if not self.enabled:
+            return
+
+        if pose_landmarks is None:
+            self.zoom    += (1.0 - self.zoom) * self.ZOOM_OUT_SMOOTH
+            self.crop_cx += (w / 2.0 - self.crop_cx) * self.PAN_SMOOTH
+            self.crop_cy += (h / 2.0 - self.crop_cy) * self.PAN_SMOOTH
+            self.last_region = None
+            self.last_mode   = None
+            return
+
+        face      = self._pts(pose_landmarks, self.FACE_IDS,     w, h)
+        shoulders = self._pts(pose_landmarks, self.SHOULDER_IDS, w, h)
+        hips      = self._pts(pose_landmarks, self.HIP_IDS,      w, h)
+
+        if not face:
+            # Not even the face is confidently visible — hold the last
+            # zoom/pan rather than snapping back; nothing new to size.
+            return
+
+        head_y = min(p[1] for p in face)
+
+        if hips:
+            # ── Original script's exact math: head-to-hip torso ──────────
+            hip_y   = sum(p[1] for p in hips) / len(hips)
             torso_h = max(hip_y - head_y, 1)
+            bottom  = hip_y + self.HIP_PAD * torso_h
+            mode    = "torso"
+        elif shoulders:
+            # ── Fallback: hips out of frame (very common on a podium/
+            # desk webcam) — frame chest-up instead of freezing at 1x ──
+            shoulder_y       = sum(p[1] for p in shoulders) / len(shoulders)
+            head_to_shoulder = max(shoulder_y - head_y, 1)
+            bottom  = shoulder_y + self.CHEST_FALLBACK_RATIO * head_to_shoulder
+            torso_h = head_to_shoulder
+            mode    = "upper-body"
+        else:
+            # ── Last resort: only the face is visible ────────────────────
+            face_ys = [p[1] for p in face]
+            face_h  = max(max(face_ys) - min(face_ys), 1)
+            bottom  = head_y + self.FACE_FALLBACK_RATIO * face_h
+            torso_h = face_h
+            mode    = "face"
 
-            top = head_y - HEAD_PAD * torso_h
-            bottom = hip_y + HIP_PAD * torso_h
-            region_h = bottom - top
+        top      = head_y - self.HEAD_PAD * torso_h
+        region_h = bottom - top
 
-            all_x = [p[0] for p in face + shoulders + hips]
-            rx1, rx2 = min(all_x), max(all_x)
-            region_w = max(rx2 - rx1, 1) * 1.30   # arm room
+        all_x    = [p[0] for p in face + shoulders + hips]
+        rx1, rx2 = min(all_x), max(all_x)
+        region_w = max(rx2 - rx1, 1) * 1.30   # arm room
 
-            frame_box = (rx1, top, rx2, bottom)
+        torso_ratio = torso_h / h
+        far_factor  = max(0.0, min(1.0, (self.FAR_THRESH - torso_ratio) / self.FAR_THRESH))
+        eff_target  = min(self.TARGET_RATIO + self.FAR_BOOST * far_factor, 0.95)
 
-            torso_ratio = torso_h / h
-            far_factor = max(0.0, min(1.0, (FAR_THRESH - torso_ratio) / FAR_THRESH))
-            eff_target = min(TARGET_RATIO + FAR_BOOST * far_factor, 0.95)
+        zoom_for_height = (eff_target * h) / region_h
+        fit_zoom_h      = h / region_h
+        fit_zoom_w      = w / region_w
 
-            zoom_for_height = (eff_target * h) / region_h
-            fit_zoom_h = h / region_h
-            fit_zoom_w = w / region_w
+        target_zoom = min(zoom_for_height, fit_zoom_h, fit_zoom_w, self.MAX_ZOOM)
+        if self.control_zone_zoom_cap is not None:
+            target_zoom = min(target_zoom, self.control_zone_zoom_cap)
+        target_zoom = max(target_zoom, 1.0)
+        smooth = self.ZOOM_IN_SMOOTH if target_zoom > self.zoom else self.ZOOM_OUT_SMOOTH
+        self.zoom += (target_zoom - self.zoom) * smooth
 
-            target_zoom = min(zoom_for_height, fit_zoom_h, fit_zoom_w, MAX_ZOOM)
-            target_zoom = max(target_zoom, 1.0)
-            smooth = ZOOM_IN_SMOOTH if target_zoom > zoom else ZOOM_OUT_SMOOTH
-            zoom += (target_zoom - zoom) * smooth
+        person_cx = (rx1 + rx2) / 2
+        person_cy = (top + bottom) / 2
+        self.crop_cx += (person_cx - self.crop_cx) * self.PAN_SMOOTH
+        self.crop_cy += (person_cy - self.crop_cy) * self.PAN_SMOOTH
 
-            person_cx = (rx1 + rx2) / 2
-            person_cy = (top + bottom) / 2
-            crop_cx += (person_cx - crop_cx) * PAN_SMOOTH
-            crop_cy += (person_cy - crop_cy) * PAN_SMOOTH
+        self.last_region = (rx1, top, rx2, bottom)
+        self.last_mode   = mode
 
-            status = f"torso={torso_ratio:.2f}  tgt={eff_target:.2f}  zoom->{target_zoom:.2f}"
+    def apply(self, frame):
+        """
+        Crop the frame around the tracked person and resize back to the
+        original frame size. No-op (returns frame unchanged) when
+        disabled or before anyone has ever been tracked.
 
-    crop_w = int(w / zoom)
-    crop_h = int(h / zoom)
-    x1 = int(crop_cx - crop_w / 2)
-    y1 = int(crop_cy - crop_h / 2)
-    x1 = max(0, min(x1, w - crop_w))
-    y1 = max(0, min(y1, h - crop_h))
-    x2 = x1 + crop_w
-    y2 = y1 + crop_h
+        Call this BEFORE drawing any HUD elements — draw everything
+        onto the frame this returns, using transform_point()/
+        transform_array() to place each element correctly, rather than
+        drawing on the raw frame and cropping the finished composite
+        (which works geometrically but blurs text/thin lines under
+        magnification).
+        """
+        if not self.enabled or self.crop_cx is None:
+            self.last_crop_rect = None
+            self.last_scale_x   = 1.0
+            self.last_scale_y   = 1.0
+            return frame
 
-    cropped = frame[y1:y2, x1:x2]
-    display = cv2.resize(cropped, (w, h))
+        h, w = frame.shape[:2]
+        crop_w = max(int(w / self.zoom), 1)
+        crop_h = max(int(h / self.zoom), 1)
+        x1 = int(self.crop_cx - crop_w / 2)
+        y1 = int(self.crop_cy - crop_h / 2)
+        x1 = max(0, min(x1, w - crop_w))
+        y1 = max(0, min(y1, h - crop_h))
 
-    if frame_box:
-        scale_x = w / crop_w
-        scale_y = h / crop_h
-        dbx1 = int((frame_box[0] - x1) * scale_x)
-        dby1 = int((frame_box[1] - y1) * scale_y)
-        dbx2 = int((frame_box[2] - x1) * scale_x)
-        dby2 = int((frame_box[3] - y1) * scale_y)
-        cv2.rectangle(display, (dbx1, dby1), (dbx2, dby2), (0, 255, 0), 2)
-        cv2.putText(display, "Waist-up", (dbx1, dby1 - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        if self.control_zone_margin is not None:
+            # The zoom-level cap already guarantees the crop is WIDE ENOUGH
+            # to contain the control zone — this additionally constrains
+            # WHERE it's centered, so panning toward an off-center subject
+            # can't push the zone (partially) out of the visible crop. The
+            # final re-clamp to frame bounds is just a safety net; given the
+            # zoom cap, it shouldn't actually change anything.
+            cz_x1, cz_y1 = self.control_zone_margin * w, self.control_zone_margin * h
+            cz_x2, cz_y2 = w - cz_x1, h - cz_y1
+            x1 = min(x1, cz_x1)
+            x1 = max(x1, cz_x2 - crop_w)
+            y1 = min(y1, cz_y1)
+            y1 = max(y1, cz_y2 - crop_h)
+            x1 = max(0, min(x1, w - crop_w))
+            y1 = max(0, min(y1, h - crop_h))
 
-    cv2.putText(display, f"Zoom: {zoom:.2f}x", (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2)
-    cv2.putText(display, status, (10, 65),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
+        x1, y1 = int(x1), int(y1)
+        x2, y2 = x1 + crop_w, y1 + crop_h
 
-    cv2.imshow("Auto Zoom", display)
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+        self.last_crop_rect = (x1, y1, crop_w, crop_h)
+        # Use the actual ratio the resize will apply, not the theoretical
+        # self.zoom value — int() rounding on crop_w/crop_h means they can
+        # differ slightly, and every overlay needs to agree with cv2.resize
+        # pixel-for-pixel or HUD elements will drift off their targets.
+        self.last_scale_x = w / crop_w
+        self.last_scale_y = h / crop_h
 
-cap.release()
-cv2.destroyAllWindows()
+        cropped = frame[y1:y2, x1:x2]
+        if cropped.size == 0:
+            return frame
+        return cv2.resize(cropped, (w, h))
+
+    def transform_point(self, x_px, y_px):
+        """
+        Maps a pixel coordinate in the ORIGINAL raw camera frame to
+        where that same physical point appears in the cropped/zoomed
+        display frame apply() last produced. Returns the coordinate
+        unchanged if no crop is currently active (disabled, or nobody
+        tracked yet) — safe to call unconditionally.
+        """
+        if self.last_crop_rect is None:
+            return x_px, y_px
+        x1, y1, crop_w, crop_h = self.last_crop_rect
+        return (x_px - x1) * self.last_scale_x, (y_px - y1) * self.last_scale_y
+
+    def transform_array(self, pts):
+        """Vectorized transform_point for an (N, 2) array of raw pixel
+        coordinates. Returns a float32 array of the same shape."""
+        pts = np.asarray(pts, dtype=np.float32)
+        if self.last_crop_rect is None:
+            return pts
+        x1, y1, crop_w, crop_h = self.last_crop_rect
+        out = pts.copy()
+        out[:, 0] = (out[:, 0] - x1) * self.last_scale_x
+        out[:, 1] = (out[:, 1] - y1) * self.last_scale_y
+        return out
+
+    def get_scale(self):
+        """
+        Current display magnification factor. Use this to scale font
+        sizes / line thicknesses / marker radii so HUD elements stay
+        legible and proportionally sized under zoom instead of looking
+        tiny relative to a magnified subject. Returns 1.0 when no crop
+        is active.
+        """
+        if self.last_crop_rect is None:
+            return 1.0
+        return (self.last_scale_x + self.last_scale_y) / 2.0
+
+    def draw_debug(self, frame):
+        """
+        Overlays a live "Zoom: X.XXx" readout (or "Zoom: OFF") plus the
+        tracked-region box, remapped into the cropped/resized frame's
+        own coordinate space — the same kind of feedback the original
+        Zoom_webcam.py prototype drew. Call this AFTER apply(), on the
+        frame apply() returned.
+        """
+        h, w = frame.shape[:2]
+        status = f"Zoom: {self.zoom:.2f}x" if self.enabled else "Zoom: OFF"
+        cv2.putText(frame, status, (10, h - 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2, cv2.LINE_AA)
+
+        if self.enabled and self.last_region is not None and self.last_crop_rect is not None:
+            rx1, top, rx2, bottom = self.last_region
+            x1, y1, crop_w, crop_h = self.last_crop_rect
+            dbx1 = int((rx1 - x1) * self.last_scale_x)
+            dby1 = int((top  - y1) * self.last_scale_y)
+            dbx2 = int((rx2 - x1) * self.last_scale_x)
+            dby2 = int((bottom - y1) * self.last_scale_y)
+            cv2.rectangle(frame, (dbx1, dby1), (dbx2, dby2), (0, 255, 0), 2)
+            label = {"torso": "Waist-up", "upper-body": "Chest-up",
+                     "face": "Face"}.get(self.last_mode, "Tracked")
+            cv2.putText(frame, label, (dbx1, max(dby1 - 8, 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2, cv2.LINE_AA)
+
+        return frame
