@@ -1,0 +1,14 @@
+# Local environment / IDE / caches
+.venv/
+.idea/
+__pycache__/
+*.pyc
+.claude/settings.local.json
+
+# Model + data binaries (too large / regenerable — keep out of git)
+/*.h5
+/*.task
+/*.csv
+/*.pki
+/*.db
+/*.pkl
