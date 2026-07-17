@@ -53,15 +53,6 @@ class CameraManager:
 
     def release(self):
         if self._picam is not None:
-            # stop() alone only halts streaming — it does NOT release the
-            # underlying camera device. Without close(), the pipeline
-            # handler stays attached to this process, so a later attempt
-            # (e.g. main.py, launched as a subprocess right after face
-            # registration) to open a fresh Picamera2() fails with
-            # "Device or resource busy" / "Pipeline handler in use by
-            # another process", because the OS still sees this process
-            # holding the camera.
             self._picam.stop()
-            self._picam.close()
         elif self._cap is not None:
             self._cap.release()

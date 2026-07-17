@@ -2,7 +2,7 @@
 zoom_webcam.py
 ───────────────
 Digital zoom/crop that keeps the tracked person framed, ported from the
-original standalone Zoom_webcam.py auto-zoom prototype into a reusable
+original standalone zoom_webcam.py auto-zoom prototype into a reusable
 class main.py can call into.
 
 The core tracking math is UNCHANGED from the original script: same POSE
@@ -50,7 +50,7 @@ import numpy as np
 
 
 class ZoomWebcamController:
-    # ── Same tunables as the original Zoom_webcam.py ────────────────────────
+    # ── Same tunables as the original zoom_webcam.py ────────────────────────
     TARGET_RATIO    = 0.80
     FAR_THRESH      = 0.45
     FAR_BOOST       = 0.18
@@ -310,7 +310,7 @@ class ZoomWebcamController:
         Overlays a live "Zoom: X.XXx" readout (or "Zoom: OFF") plus the
         tracked-region box, remapped into the cropped/resized frame's
         own coordinate space — the same kind of feedback the original
-        Zoom_webcam.py prototype drew. Call this AFTER apply(), on the
+        zoom_webcam.py prototype drew. Call this AFTER apply(), on the
         frame apply() returned.
         """
         h, w = frame.shape[:2]
