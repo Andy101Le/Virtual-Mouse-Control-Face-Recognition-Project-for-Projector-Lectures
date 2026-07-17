@@ -93,7 +93,11 @@ class PTZController:
     # reacting — basically demanding pixel-perfect centering) to a wider,
     # more forgiving band so normal fidgeting/shifting in place doesn't
     # trigger constant tiny corrections.
-    CENTER_TOLERANCE     = 0.19
+    #
+    # NB: the servo steps are coarse — it can't land precisely on dead-center,
+    # so a tight tolerance just makes it hunt/dither around the middle. Keep
+    # this band wide enough to swallow one servo step's worth of movement.
+    CENTER_TOLERANCE     = 0.19154
 
     # ── Tunables: position smoothing ─────────────────────────────────────────
     # EMA applied to the incoming nose position itself, BEFORE computing
@@ -102,12 +106,12 @@ class PTZController:
     # immediately yields a full-strength motor command; it has to persist
     # across a few frames to move the smoothed position enough to matter.
     # Lower = smoother but slower to follow real movement; higher = snappier.
-    POSITION_SMOOTH_ALPHA = 0.75
+    POSITION_SMOOTH_ALPHA = 0.45
 
     # ── Tunables: pan/tilt (fine, face-driven) ──────────────────────────────
-    PAN_GAIN             = 28.0
+    PAN_GAIN             = 26.0
     TILT_GAIN            = 22.0
-    MAX_STEP_PER_TICK    = 1    # lowered from 6 — smaller per-tick steps,
+    MAX_STEP_PER_TICK    = 2    # lowered from 6 — smaller per-tick steps,
                                   # smoother-looking motion at the same
                                   # overall tracking speed (more, gentler
                                   # ticks rather than fewer, larger jumps)
@@ -130,6 +134,13 @@ class PTZController:
         self.verbose     = verbose
 
         self._focuser = Focuser(i2c_bus)
+
+        # Pan/tilt and focus are different registers but share ONE I2C bus and
+        # busy flag. The autofocus controller drives OPT_FOCUS from its own
+        # thread; this lock serialises every bus transaction so the two never
+        # collide mid-read. Exposed via .io_lock so AutoFocusController can
+        # take the same one.
+        self._io_lock = threading.Lock()
 
         # State machine
         self._state            = STATE_LOST
@@ -179,8 +190,9 @@ class PTZController:
         number.
         """
         try:
-            mx_raw = self._focuser.get(Focuser.OPT_MOTOR_X)
-            my_raw = self._focuser.get(Focuser.OPT_MOTOR_Y)
+            with self._io_lock:
+                mx_raw = self._focuser.get(Focuser.OPT_MOTOR_X)
+                my_raw = self._focuser.get(Focuser.OPT_MOTOR_Y)
 
             mx = self._clamp(mx_raw, Focuser.opts[Focuser.OPT_MOTOR_X]["MIN_VALUE"],
                               Focuser.opts[Focuser.OPT_MOTOR_X]["MAX_VALUE"])
@@ -192,8 +204,9 @@ class PTZController:
                       f"valid range at startup (raw motor_x={mx_raw}, motor_y={my_raw}) "
                       f"— clamping to (motor_x={mx}, motor_y={my}) and re-writing "
                       f"corrected values to hardware now.")
-                self._focuser.set(Focuser.OPT_MOTOR_X, mx, 0)
-                self._focuser.set(Focuser.OPT_MOTOR_Y, my, 0)
+                with self._io_lock:
+                    self._focuser.set(Focuser.OPT_MOTOR_X, mx, 0)
+                    self._focuser.set(Focuser.OPT_MOTOR_Y, my, 0)
 
             self._targets = _Targets(mx, my)
             with self._telemetry_lock:
@@ -204,6 +217,17 @@ class PTZController:
             self._targets = _Targets(90, 90)  # safe-ish mid-range fallback
 
     # ── Public API ──────────────────────────────────────────────────────────
+    @property
+    def focuser(self):
+        """The shared Focuser instance (so autofocus can drive OPT_FOCUS)."""
+        return self._focuser
+
+    @property
+    def io_lock(self):
+        """Shared I2C-bus lock — take this around any Focuser access made
+        from another thread so it can't collide with pan/tilt writes."""
+        return self._io_lock
+
     def update(self, nose_pos, recognised_user, is_registered_face_visible,
                pose_landmarks=None):
         """
@@ -251,6 +275,21 @@ class PTZController:
 
     def set_enabled(self, enabled: bool):
         self.enabled = enabled
+
+    def set_active_user(self, username):
+        """
+        Tell the controller WHOSE face counts as the tracking target. Until
+        this is set, is_target_visible can never be true (recognised_user is
+        compared against self.active_user), so the camera would sit in LOST
+        and never move. Called on login so the PTZ follows the person who
+        just signed in.
+
+        Clears the tracking anchors so a user switch re-acquires from the new
+        person's real position rather than smoothing in from the old one.
+        """
+        self.active_user          = username
+        self._last_known_face_pos = None
+        self._smoothed_pos        = None
 
     def is_locked(self) -> bool:
         """True whenever actively tracking (face-lock OR pose-search),
@@ -441,7 +480,8 @@ class PTZController:
                 # real servo sits pinned at its end stop.
                 new_val = self._clamp(raw_new_val, mx_lo, mx_hi)
                 at_limit = (new_val != raw_new_val)
-                self._focuser.set(Focuser.OPT_MOTOR_X, new_val, 0)
+                with self._io_lock:
+                    self._focuser.set(Focuser.OPT_MOTOR_X, new_val, 0)
                 pan_dir = "RIGHT" if step > 0 else "LEFT"
                 limit_note = "  *** AT PHYSICAL LIMIT ***" if at_limit else ""
                 self._log(f"PAN  err_x={err_x:+.3f} step={step:+.1f} "
@@ -460,7 +500,8 @@ class PTZController:
                 raw_new_val = self._targets.motor_y + int(round(step))
                 new_val = self._clamp(raw_new_val, my_lo, my_hi)
                 at_limit = (new_val != raw_new_val)
-                self._focuser.set(Focuser.OPT_MOTOR_Y, new_val, 0)
+                with self._io_lock:
+                    self._focuser.set(Focuser.OPT_MOTOR_Y, new_val, 0)
                 tilt_dir = "DOWN" if step > 0 else "UP"
                 limit_note = "  *** AT PHYSICAL LIMIT ***" if at_limit else ""
                 self._log(f"TILT err_y={err_y:+.3f} step={step:+.1f} "
