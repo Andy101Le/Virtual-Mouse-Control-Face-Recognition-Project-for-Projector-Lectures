@@ -1,0 +1,105 @@
+{% extends "base.html" %}
+{% block title %}Admin — Gesture Control{% endblock %}
+{% block main_class %}container{% endblock %}
+
+{% block content %}
+<h1 style="font-size:1.35rem;margin:1.5rem 0 0.25rem">Admin</h1>
+<p style="color:var(--ink-muted);font-size:.9rem;margin-bottom:1.5rem">
+  Manage accounts and the computers paired to them.
+</p>
+
+<div class="panel">
+  <h2>Accounts</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>User</th>
+        <th>Role</th>
+        <th>Face</th>
+        <th>Actions</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for u in users %}
+      <tr data-user="{{ u.username }}">
+        <td><b>{{ u.username }}</b></td>
+        <td>
+          {% if u.is_admin %}<span class="badge admin">Admin</span>
+          {% else %}<span class="badge">User</span>{% endif %}
+        </td>
+        <td>
+          {% if u.face_registered %}<span class="badge face">Registered</span>
+          {% else %}<span class="badge">None</span>{% endif %}
+        </td>
+        <td>
+          <div class="row-actions">
+            <button class="secondary" data-act="rename">Rename</button>
+            <button class="secondary" data-act="password">Password</button>
+            <button class="secondary" data-act="toggle_admin">
+              {% if u.is_admin %}Make user{% else %}Make admin{% endif %}
+            </button>
+            <button class="secondary" data-act="clear_face">Clear face</button>
+            <button class="secondary danger" data-act="delete">Delete</button>
+          </div>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<div class="panel">
+  <h2>Add an account</h2>
+  <div style="display:grid;grid-template-columns:1fr 1fr auto auto;gap:.6rem;align-items:end">
+    <label style="margin:0">Username
+      <input type="text" id="new-username" autocomplete="off">
+    </label>
+    <label style="margin:0">Password
+      <input type="password" id="new-password" autocomplete="new-password">
+    </label>
+    <label style="margin:0 0 .7rem">
+      <input type="checkbox" id="new-admin"> Admin
+    </label>
+    <button id="add-user" style="margin:0">Add</button>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>Paired computers</h2>
+  {% if devices %}
+  <table>
+    <thead>
+      <tr><th>Computer</th><th>Address</th><th>Owner</th><th>Paired</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for d in devices %}
+      <tr>
+        <td>{{ d.name or 'Paired computer' }}</td>
+        <td class="mono">{{ d.mac }}</td>
+        <td>{{ d.username }}</td>
+        <td class="mono">{{ d.paired_at }}</td>
+        <td>
+          <button class="secondary danger" data-forget="{{ d.mac }}">Forget</button>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty">No computers are paired yet.</p>
+  {% endif %}
+</div>
+
+<div class="panel">
+  <h2>Danger zone</h2>
+  <p style="font-size:.88rem;color:var(--ink-muted)">
+    Deletes every account, face, and pairing on this Pi. You'll be signed out
+    and asked to create a new admin account.
+  </p>
+  <button class="secondary danger" id="reset-all">Erase everything</button>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/admin.js') }}"></script>
+{% endblock %}

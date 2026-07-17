@@ -1,0 +1,193 @@
+{% extends "base.html" %}
+{% block title %}Camera — Gesture Control{% endblock %}
+{% block main_class %}console{% endblock %}
+
+{% block content %}
+<!-- ── LEFT: the monitor ─────────────────────────────────────────────── -->
+<section>
+  <div class="panel">
+    <h2>Camera</h2>
+    <div class="monitor">
+      <img id="preview" alt="Live camera preview" hidden>
+      <span class="placeholder" id="preview-placeholder">Waiting for camera…</span>
+    </div>
+
+    <div class="readout">
+      <span>fps <b id="t-fps">—</b></span>
+      <span>zoom <b id="t-zoom">—</b></span>
+      <span>framing <b id="t-mode">—</b></span>
+      <span>tracking <b id="t-ptz">—</b></span>
+      <span>focus <b id="t-focus">—</b></span>
+      <span>user <b id="t-user">—</b></span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Camera position</h2>
+
+    <div class="modes" role="group" aria-label="Camera control mode">
+      <button id="mode-auto"   aria-pressed="true">Follow me</button>
+      <button id="mode-manual" aria-pressed="false">Manual</button>
+    </div>
+    <p class="sub" id="mode-hint"
+       style="font-size:.8rem;color:var(--ink-muted);margin:-.4rem 0 1rem">
+      The camera is following the person it recognises. Switch to manual to aim it yourself.
+    </p>
+
+    <div class="dpad">
+      <button class="up"    data-tilt="2"  disabled aria-label="Tilt up">↑</button>
+      <button class="left"  data-pan="-2"  disabled aria-label="Pan left">←</button>
+      <button class="home"  id="ptz-center" disabled aria-label="Center camera">center</button>
+      <button class="right" data-pan="2"   disabled aria-label="Pan right">→</button>
+      <button class="down"  data-tilt="-2" disabled aria-label="Tilt down">↓</button>
+    </div>
+
+    <div class="slider-row">
+      <label for="pan">Pan <b id="pan-val">—</b></label>
+      <input type="range" id="pan" disabled
+             min="{{ limits.pan.min }}" max="{{ limits.pan.max }}">
+    </div>
+    <div class="slider-row">
+      <label for="tilt">Tilt <b id="tilt-val">—</b></label>
+      <input type="range" id="tilt" disabled
+             min="{{ limits.tilt.min }}" max="{{ limits.tilt.max }}">
+    </div>
+
+    {% if limits.hw_zoom %}
+    <div class="slider-row">
+      <label for="hwzoom">Optical zoom <b id="hwzoom-val">—</b></label>
+      <input type="range" id="hwzoom" disabled
+             min="{{ limits.hw_zoom.min }}" max="{{ limits.hw_zoom.max }}">
+    </div>
+    {% endif %}
+
+    <hr>
+
+    <div class="slider-row">
+      <label for="digizoom">
+        Auto-zoom limit <b id="digizoom-val">2.5×</b>
+      </label>
+      <input type="range" id="digizoom" min="1" max="4" step="0.1" value="2.5">
+    </div>
+    <label style="font-size:.85rem">
+      <input type="checkbox" id="zoom-enabled" checked role="switch">
+      Zoom to frame me automatically
+    </label>
+    <p style="font-size:.78rem;color:var(--ink-muted);margin-top:.5rem">
+      Auto-zoom won't crop tighter than your reach, so your hand stays in
+      frame at the edges of the control zone. Raising the limit past about
+      1.4× has no visible effect for that reason.
+    </p>
+
+    <hr>
+
+    <label style="font-size:.85rem">
+      <input type="checkbox" id="focus-auto" checked role="switch">
+      Keep me in focus automatically
+    </label>
+    <p style="font-size:.78rem;color:var(--ink-muted);margin:.4rem 0 .75rem">
+      A full focus sweep runs once at startup, then the lens quietly
+      refocuses only when the picture goes soft — it works out which way
+      to focus on its own, like a phone camera.
+    </p>
+
+    <div style="display:flex;gap:.5rem;align-items:center;margin-bottom:.75rem">
+      <button class="secondary" id="focus-now">Focus now</button>
+      <span style="font-size:.8rem;color:var(--ink-muted)">focus
+        <b id="focus-state">—</b></span>
+    </div>
+
+    <div class="slider-row">
+      <label for="focus">Manual focus <b id="focus-val">—</b></label>
+      <input type="range" id="focus" min="0" max="18000" step="100" disabled>
+    </div>
+  </div>
+</section>
+
+<!-- ── RIGHT: pairing, face, devices ─────────────────────────────────── -->
+<aside>
+  <div class="panel">
+    <h2>Your computer</h2>
+
+    <div id="pair-idle">
+      <p style="font-size:.88rem;color:var(--ink-muted)">
+        Pair the computer you want to control. The Pi appears in its Bluetooth
+        settings as <b>Gesture Touchpad</b>.
+      </p>
+      <button id="pair-start">Pair a computer</button>
+    </div>
+
+    <div id="pair-waiting" hidden>
+      <p style="font-size:.88rem">
+        Open Bluetooth settings on your computer and connect to
+        <b>Gesture Touchpad</b>.
+      </p>
+      <progress></progress>
+      <button class="secondary" id="pair-cancel">Cancel</button>
+    </div>
+
+    <div id="pair-confirm" hidden>
+      <p style="font-size:.88rem">Does your computer show this code?</p>
+      <div class="passkey" id="passkey">——————</div>
+      <div style="display:flex;gap:.5rem">
+        <button id="pair-yes">Codes match</button>
+        <button class="secondary danger" id="pair-no">Reject</button>
+      </div>
+    </div>
+
+    <div id="pair-error" hidden>
+      <p class="flash flash-error" id="pair-error-msg"></p>
+      <button class="secondary" id="pair-retry">Try again</button>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Paired computers</h2>
+    <div id="devices">
+      {% if devices %}
+        {% for d in devices %}
+        <div class="device">
+          <div class="meta">
+            <div class="name">{{ d.name or 'Paired computer' }}</div>
+            <div class="mac">{{ d.mac }}</div>
+          </div>
+          <button class="secondary danger" data-forget="{{ d.mac }}">Forget</button>
+        </div>
+        {% endfor %}
+      {% else %}
+        <p class="empty">Nothing paired yet.</p>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Your face</h2>
+    {% if has_face %}
+      <p style="font-size:.88rem">
+        <span class="badge face">Registered</span>
+        The system will only take gestures from you.
+      </p>
+      <div style="display:flex;gap:.5rem;margin-top:.75rem">
+        <button class="secondary" id="face-start">Register again</button>
+        <button class="secondary danger" id="face-clear">Remove</button>
+      </div>
+    {% else %}
+      <p style="font-size:.88rem;color:var(--ink-muted)">
+        Register your face so the system knows to take gestures from you and
+        ignore everyone else in the room.
+      </p>
+      <button id="face-start">Register my face</button>
+    {% endif %}
+
+    <div id="face-capture" hidden style="margin-top:1rem">
+      <p style="font-size:.88rem" id="face-status">Look at the camera.</p>
+      <div class="capture-bar"><div id="face-bar"></div></div>
+      <button class="secondary" id="face-cancel">Cancel</button>
+    </div>
+  </div>
+</aside>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
+{% endblock %}

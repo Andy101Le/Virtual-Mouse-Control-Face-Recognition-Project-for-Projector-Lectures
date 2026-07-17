@@ -1,0 +1,280 @@
+/* ─────────────────────────────────────────────────────────────────────────
+   app.css — control-surface layer on top of Pico.css
+
+   The vernacular here is AV/broadcast gear, not a SaaS dashboard: a camera
+   monitor with crop marks, a tally light, a PTZ control pad, telemetry in
+   monospace. Slate base rather than pure black, because a preview image
+   reads better against a surround that isn't crushing to 0.
+
+   Tally colours are SEMANTIC, not decorative — they mean the same thing
+   they do on real broadcast gear:
+       red   = live  (a computer is connected and being driven)
+       green = ready (paired and standing by)
+       grey  = idle  (nothing paired)
+
+   Dark mode is driven by prefers-color-scheme, which Chrome and Firefox
+   both support natively. Pico handles the base; we just re-point our own
+   tokens.
+   ───────────────────────────────────────────────────────────────────────── */
+
+:root {
+  --surface:      #ffffff;
+  --surface-2:    #f2f4f7;
+  --edge:         #d6dae1;
+  --ink:          #1a1f27;
+  --ink-muted:    #6b7483;
+  --monitor-bg:   #0d1014;
+
+  --tally-live:   #e5484d;
+  --tally-ready:  #30a46c;
+  --tally-idle:   #8b95a3;
+  --control:      #d97a1a;
+
+  --mono: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --surface:   #161a20;
+    --surface-2: #1d222a;
+    --edge:      #2b3038;
+    --ink:       #e6e9ee;
+    --ink-muted: #8b95a3;
+  }
+}
+
+body { color: var(--ink); }
+
+/* ── Top bar ─────────────────────────────────────────────────────────── */
+.topbar {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 1rem;
+  padding: 0.6rem 1.25rem;
+  border-bottom: 1px solid var(--edge);
+  background: var(--surface);
+}
+.topbar ul {
+  display: flex; align-items: center; gap: 1.25rem;
+  margin: 0; padding: 0; list-style: none;
+}
+.topbar .brand { display: flex; align-items: center; gap: 0.6rem; }
+.topbar .who {
+  font-family: var(--mono); font-size: 0.85rem; color: var(--ink-muted);
+}
+
+/* Tally light — the one piece of borrowed hardware language on the page. */
+.tally {
+  width: 10px; height: 10px; border-radius: 50%;
+  background: var(--tally-idle);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--tally-idle) 20%, transparent);
+  transition: background 200ms, box-shadow 200ms;
+}
+.tally[data-state="ready"] {
+  background: var(--tally-ready);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--tally-ready) 22%, transparent);
+}
+.tally[data-state="live"] {
+  background: var(--tally-live);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--tally-live) 25%, transparent);
+  animation: pulse 1.6s ease-in-out infinite;
+}
+@keyframes pulse { 50% { opacity: 0.55; } }
+@media (prefers-reduced-motion: reduce) {
+  .tally[data-state="live"] { animation: none; }
+}
+
+/* ── Dashboard layout ────────────────────────────────────────────────── */
+.console {
+  display: grid;
+  grid-template-columns: minmax(0, 1.7fr) minmax(320px, 1fr);
+  gap: 1.5rem;
+  padding: 1.5rem;
+  max-width: 1500px; margin: 0 auto;
+}
+@media (max-width: 950px) {
+  .console { grid-template-columns: 1fr; }
+}
+
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--edge);
+  border-radius: 8px;
+  padding: 1.1rem 1.25rem;
+  margin-bottom: 1.25rem;
+}
+.panel > h2 {
+  font-size: 0.78rem; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.09em;
+  color: var(--ink-muted);
+  margin: 0 0 0.9rem;
+}
+
+/* ── Camera monitor ──────────────────────────────────────────────────── */
+.monitor {
+  position: relative;
+  background: var(--monitor-bg);
+  border: 1px solid var(--edge);
+  border-radius: 8px;
+  overflow: hidden;
+  aspect-ratio: 4 / 3;
+  display: grid; place-items: center;
+}
+.monitor img { width: 100%; height: 100%; object-fit: contain; display: block; }
+.monitor .placeholder {
+  color: var(--ink-muted); font-family: var(--mono); font-size: 0.85rem;
+}
+/* Crop marks — signals "this is a viewfinder", not a photo. */
+.monitor::before, .monitor::after {
+  content: ""; position: absolute; width: 18px; height: 18px;
+  border-color: color-mix(in srgb, #ffffff 35%, transparent);
+  pointer-events: none;
+}
+.monitor::before { top: 10px; left: 10px;  border-top: 2px solid; border-left: 2px solid; }
+.monitor::after  { bottom: 10px; right: 10px; border-bottom: 2px solid; border-right: 2px solid; }
+
+.readout {
+  display: flex; flex-wrap: wrap; gap: 0.4rem 1.5rem;
+  margin-top: 0.75rem;
+  font-family: var(--mono); font-size: 0.8rem;
+  color: var(--ink-muted);
+}
+.readout b {
+  color: var(--ink); font-weight: 600; margin-left: 0.35rem;
+}
+
+/* ── PTZ control pad ─────────────────────────────────────────────────── */
+.dpad {
+  display: grid;
+  grid-template-columns: repeat(3, 3rem);
+  grid-template-rows: repeat(3, 3rem);
+  gap: 0.35rem;
+  justify-content: center;
+  margin: 0.5rem 0 1rem;
+}
+.dpad button {
+  margin: 0; padding: 0;
+  display: grid; place-items: center;
+  font-family: var(--mono); font-size: 1rem;
+  background: var(--surface-2);
+  border: 1px solid var(--edge);
+  color: var(--ink);
+  border-radius: 6px;
+}
+.dpad button:hover:not(:disabled) {
+  border-color: var(--control);
+  color: var(--control);
+}
+.dpad button:disabled { opacity: 0.35; cursor: not-allowed; }
+.dpad .up    { grid-area: 1 / 2; }
+.dpad .left  { grid-area: 2 / 1; }
+.dpad .home  { grid-area: 2 / 2; font-size: 0.7rem; }
+.dpad .right { grid-area: 2 / 3; }
+.dpad .down  { grid-area: 3 / 2; }
+
+.slider-row { margin-bottom: 0.9rem; }
+.slider-row label {
+  display: flex; justify-content: space-between; align-items: baseline;
+  font-size: 0.8rem; color: var(--ink-muted); margin-bottom: 0.2rem;
+}
+.slider-row label b { font-family: var(--mono); color: var(--ink); }
+.slider-row input[type="range"] { margin: 0; }
+
+/* ── Mode switch ─────────────────────────────────────────────────────── */
+.modes { display: flex; gap: 0.4rem; margin-bottom: 1rem; }
+.modes button {
+  flex: 1; margin: 0; padding: 0.45rem;
+  font-size: 0.82rem;
+  background: var(--surface-2);
+  border: 1px solid var(--edge);
+  color: var(--ink-muted);
+}
+.modes button[aria-pressed="true"] {
+  background: color-mix(in srgb, var(--control) 14%, transparent);
+  border-color: var(--control);
+  color: var(--control);
+  font-weight: 600;
+}
+
+/* ── Devices ─────────────────────────────────────────────────────────── */
+.device {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.65rem 0;
+  border-bottom: 1px solid var(--edge);
+}
+.device:last-child { border-bottom: 0; }
+.device .meta { min-width: 0; }
+.device .name { font-weight: 600; font-size: 0.9rem; }
+.device .mac {
+  font-family: var(--mono); font-size: 0.75rem; color: var(--ink-muted);
+}
+.device button { margin: 0; width: auto; padding: 0.3rem 0.7rem; font-size: 0.78rem; }
+
+.empty {
+  padding: 1.5rem 0; text-align: center;
+  color: var(--ink-muted); font-size: 0.88rem;
+}
+
+/* ── Passkey confirmation ────────────────────────────────────────────── */
+.passkey {
+  font-family: var(--mono);
+  font-size: 2.1rem; font-weight: 600;
+  letter-spacing: 0.22em;
+  text-align: center;
+  padding: 0.8rem 0;
+  color: var(--ink);
+}
+
+/* ── Progress ────────────────────────────────────────────────────────── */
+.capture-bar {
+  height: 6px; border-radius: 3px;
+  background: var(--surface-2);
+  overflow: hidden; margin: 0.6rem 0;
+}
+.capture-bar > div {
+  height: 100%; width: 0;
+  background: var(--tally-ready);
+  transition: width 120ms linear;
+}
+
+/* ── Flash messages ──────────────────────────────────────────────────── */
+.flash {
+  padding: 0.7rem 1rem; border-radius: 6px;
+  margin-bottom: 1rem; font-size: 0.9rem;
+  border: 1px solid var(--edge);
+}
+.flash-error {
+  border-color: var(--tally-live);
+  background: color-mix(in srgb, var(--tally-live) 10%, transparent);
+}
+.flash-ok {
+  border-color: var(--tally-ready);
+  background: color-mix(in srgb, var(--tally-ready) 10%, transparent);
+}
+
+/* ── Auth pages ──────────────────────────────────────────────────────── */
+.auth-wrap {
+  max-width: 380px; margin: 0 auto; padding: 4rem 1.25rem;
+}
+.auth-wrap h1 { font-size: 1.4rem; margin-bottom: 0.25rem; }
+.auth-wrap .sub {
+  color: var(--ink-muted); font-size: 0.88rem; margin-bottom: 1.75rem;
+}
+
+/* ── Admin tables ────────────────────────────────────────────────────── */
+table { font-size: 0.88rem; }
+table td.mono, table td .mono { font-family: var(--mono); font-size: 0.8rem; }
+.row-actions { display: flex; flex-wrap: wrap; gap: 0.3rem; }
+.row-actions button {
+  margin: 0; width: auto; padding: 0.25rem 0.6rem; font-size: 0.75rem;
+}
+.badge {
+  display: inline-block; padding: 0.1rem 0.45rem;
+  border-radius: 4px; font-size: 0.7rem; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.05em;
+  border: 1px solid var(--edge); color: var(--ink-muted);
+}
+.badge.admin  { border-color: var(--control);      color: var(--control); }
+.badge.face   { border-color: var(--tally-ready);  color: var(--tally-ready); }
+
+.danger { border-color: var(--tally-live) !important; color: var(--tally-live) !important; }
