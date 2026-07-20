@@ -284,7 +284,12 @@ class BluetoothHIDDevice:
         )
 
         try:
-            manager.RegisterProfile(PROFILE_DBUS_PATH, HID_UUID, opts)
+            # RegisterProfile's first argument must marshal as D-Bus signature
+            # 'o' (object path), not 's' (string). A plain Python str for
+            # PROFILE_DBUS_PATH serialises as 's', so BlueZ sees a call with
+            # signature "ssa{sv}" and reports RegisterProfile as nonexistent
+            # (no overload matches) even though the method itself is fine.
+            manager.RegisterProfile(dbus.ObjectPath(PROFILE_DBUS_PATH), HID_UUID, opts)
             log.info("HID profile registered with BlueZ")
         except dbus.exceptions.DBusException as e:
             # Already-registered is benign on a restart; anything else isn't.
