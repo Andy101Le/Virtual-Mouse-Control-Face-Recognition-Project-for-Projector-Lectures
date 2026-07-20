@@ -1,175 +1,109 @@
-# pyenv Setup on Raspberry Pi 5 (Raspberry Pi OS Trixie)
+# Developer Setup (venv-based)
 
-## Overview
+This is the manual, step-by-step setup for a developer working on this
+project directly with a Python virtual environment. It applies whether
+you're on a Raspberry Pi or a regular dev machine — camera, I2C
+(PTZ/focus), and Bluetooth hardware are optional; the code falls back
+or disables those features gracefully when the hardware or system
+packages for them aren't present.
 
-pyenv lets you install and switch between multiple Python versions without touching the system Python. This guide installs Python 3.12 alongside the system Python 3.13.
+For a one-command Raspberry Pi deployment (systemd service, no manual
+steps), use `../install.sh` instead — this document only covers the
+venv workflow it's built on top of.
 
----
-
-## 1. Install Build Dependencies
-
-pyenv compiles Python from source, so you need the full build toolchain first:
-
-```bash
-sudo apt update; sudo apt install -y \
-  make build-essential libssl-dev zlib1g-dev \
-  libbz2-dev libreadline-dev libsqlite3-dev curl git \
-  libncursesw5-dev xz-utils tk-dev libxml2-dev libxmlsec1-dev libffi-dev liblzma-dev
-```
+A second, venv-free setup path for pre-imaged SD cards is being
+evaluated separately. This document may get a follow-up section once
+that's decided; it isn't resolved here.
 
 ---
 
-## 2. Install pyenv
+## 1. Clone the Repo
 
 ```bash
-curl https://pyenv.run | bash
+git clone git@github.com:Andy101Le/Virtual-Mouse-Control-Face-Recognition-Project-for-Projector-Lectures.git ~/virtMouse
+cd ~/virtMouse
 ```
 
-This installs pyenv and the following plugins automatically:
-- `pyenv` — core version manager
-- `pyenv-update` — lets you run `pyenv update`
-- `pyenv-virtualenv` — venv management via pyenv
-
----
-
-## 3. Configure Your Shell
-
-Add the following to `~/.bashrc`:
+## 2. Fetch the MediaPipe Model Files
 
 ```bash
-export PYENV_ROOT="$HOME/.pyenv"
-[[ -d $PYENV_ROOT/bin ]] && export PATH="$PYENV_ROOT/bin:$PATH"
-eval "$(pyenv init - bash)"
+python3 download_models.py
 ```
 
-Apply immediately:
+This pulls `hand_landmarker.task`, `face_landmarker.task`, and
+`pose_landmarker_lite.task` into the repo root if they aren't already
+present. It only uses the standard library, so it can run before the
+virtual environment exists.
+
+## 3. System Packages (Raspberry Pi only)
+
+If you're doing camera/PTZ/Bluetooth development on a Pi, install
+these first — they're not available in a usable form from PyPI:
 
 ```bash
-source ~/.bashrc
+sudo apt update
+sudo apt install -y python3.11-venv python3-picamera2 python3-smbus \
+  python3-dbus python3-gi bluez
 ```
 
-Verify pyenv is working:
+On a non-Pi dev machine you can skip this — the app falls back to a
+USB webcam via OpenCV when `picamera2` isn't importable, and disables
+the Bluetooth manager when `dbus`/`gi` aren't importable.
+
+## 4. Create and Activate the Virtual Environment
 
 ```bash
-pyenv --version
-```
-
----
-
-## 4. Install Python 3.12
-
-```bash
-pyenv install 3.12.10
-```
-
-> This compiles Python from source and takes **10–15 minutes** on a Pi 5. The `--enable-optimizations` flag is applied automatically by pyenv for better runtime performance.
-
-Confirm it installed:
-
-```bash
-pyenv versions
-```
-
-You should see both `system` (3.13) and `3.12.10` listed.
-
----
-
-## 5. Set the Python Version
-
-You have three scope options:
-
-| Command | Scope |
-|---|---|
-| `pyenv global 3.12.10` | Default for your user everywhere |
-| `pyenv local 3.12.10` | This directory only (writes `.python-version`) |
-| `pyenv shell 3.12.10` | Current shell session only |
-
-For a project-specific setup (recommended):
-
-```bash
-git clone git@github.com:Andy101Le/Virtual-Mouse-Control-Face-Recognition-Project-for-Projector-Lectures.git ~/virtMouse && cd virtMouse
-pyenv local 3.12.10
-python --version  # should show 3.12.10
-```
-
----
-
-## 6. Create a Virtual Environment
-
-```bash
-python -m venv .venv
+python3.11 -m venv --system-site-packages .venv
 source .venv/bin/activate
-pip install --upgrade pip wheel
 ```
 
-Your prompt will show `(.venv)` when active.
+`--system-site-packages` matters on a Pi: it's what makes the
+apt-installed `picamera2`, `smbus`, `dbus`, and `gi` packages visible
+inside the venv. Without it, those imports fail even though the
+packages are installed system-wide. On a non-Pi machine without those
+system packages, this flag is harmless either way.
 
----
-
-## 7. Install Your Packages
+## 5. Install Dependencies
 
 ```bash
-pip install "protobuf>=4.25.3,<5"
-
-pip install \
-  "mediapipe==0.10.14" \
-  "tensorflow-aarch64==2.16.1" \
-  opencv-python \
-  numpy \
-  pyautogui
+pip install --upgrade pip
+pip install -r setup/requirements.txt
 ```
 
-> **TensorFlow note:** The install is large (~500 MB). If you only need inference, consider `pip install tflite-runtime` instead — it's much smaller and loads faster on Pi hardware.
+If you add a new import anywhere in the project, add the corresponding
+package to `setup/requirements.txt` at the same time — it's meant to
+be a complete, accurate list of what the app actually needs, not just
+a starting point.
 
----
-
-## 8. Verify All Imports
+## 6. Run the App
 
 ```bash
-python - <<'EOF'
-import cv2
-import time
-import threading
-import mediapipe as mp
-from mediapipe.tasks.python import vision
-from mediapipe.tasks.python.core.base_options import BaseOptions
-import numpy as np
-from tensorflow.keras.models import load_model
-import pyautogui
-
-print("All imports OK")
-print(f"Python:  {__import__('sys').version}")
-print(f"OpenCV:  {cv2.__version__}")
-print(f"NumPy:   {np.__version__}")
-EOF
+sudo .venv/bin/python web_server.py
 ```
 
----
+Root is required because `bluetooth_hid.py` binds raw L2CAP sockets
+(PSM 17/19) for the Bluetooth HID touchpad — see
+[`SETUP_BLUETOOTH.md`](../SETUP_BLUETOOTH.md) for why, and for the
+one-time `bluetoothd` configuration pairing needs. If you're doing
+pure UI/gesture-pipeline work without touching Bluetooth, running
+without `sudo` is fine; the Bluetooth manager just logs that it's
+unavailable and the rest of the app works normally.
 
-## Quick Reference
+The web UI serves on port 8080 (e.g. `http://<host>:8080`).
 
-| Task | Command |
-|---|---|
-| List installed versions | `pyenv versions` |
-| List installable versions | `pyenv install --list \| grep "3\.12"` |
-| Activate venv | `source .venv/bin/activate` |
-| Deactivate venv | `deactivate` |
-| Update pyenv itself | `pyenv update` |
-| Uninstall a version | `pyenv uninstall 3.12.10` |
-| Check active version | `pyenv version` |
+## 7. First-Run Setup (Manual Steps)
 
----
+These aren't handled by any script — they're one-time steps through
+the web UI itself:
 
-## Troubleshooting
-
-**`pyenv: command not found` after install**
-You haven't sourced your shell config. Run `source ~/.bashrc` or open a new terminal.
-
-**Build fails with `lzma` or `ssl` warning**
-The build dependency install in Step 1 covers this. If you skipped it, run it now and reinstall: `pyenv uninstall 3.12.10 && pyenv install 3.12.10`.
-
-**`python` still shows 3.13**
-Check that `pyenv local` or `pyenv global` has been set and that the pyenv shims are in your `PATH` before `/usr/bin`. Run `which python` — it should point to somewhere inside `~/.pyenv/shims/`.
-
-**pyautogui fails at runtime (no display)**
-pyautogui requires an X display. If running headless, prefix your command with `DISPLAY=:0` or switch to the desktop image of Raspberry Pi OS.
+1. **Create an account** at `/signup`. The first account created
+   becomes an admin.
+2. **Register your face** from the dashboard's face-registration
+   control. This drives `gesture.begin_face_capture()` and stores the
+   embedding in `login_system.db` — there's no standalone script for
+   this anymore (an older one was removed when the Tkinter app was
+   replaced by this web UI).
+3. **Pair a Bluetooth host** from the dashboard's "Pair a computer"
+   control, once `SETUP_BLUETOOTH.md`'s `bluetoothd` configuration is
+   in place. BlueZ will show a 6-digit passkey in the web UI; confirm
+   it matches what your laptop shows to complete pairing.
