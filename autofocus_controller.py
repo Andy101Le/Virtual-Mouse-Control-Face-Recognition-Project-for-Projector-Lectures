@@ -120,7 +120,6 @@ class AutoFocusController:
         self._state           = STATE_STARTUP
 
         self._stop       = threading.Event()
-        self._sweep_done = threading.Event()
         self._worker     = threading.Thread(target=self._run, daemon=True,
                                             name="autofocus")
 
@@ -131,10 +130,6 @@ class AutoFocusController:
     def close(self):
         self._stop.set()
         self._worker.join(timeout=2.0)
-
-    def wait_for_startup(self, timeout=None):
-        """Block until the initial full sweep has finished (or timeout)."""
-        return self._sweep_done.wait(timeout=timeout)
 
     # ── Fed by the vision loop (cheap, no hardware I/O) ──────────────────────
     def report_frame(self, frame):
@@ -216,7 +211,6 @@ class AutoFocusController:
             except Exception:
                 log.exception("Autofocus startup sweep failed")
         self._state = STATE_IDLE
-        self._sweep_done.set()
 
         soft_count = 0
         while not self._stop.is_set():

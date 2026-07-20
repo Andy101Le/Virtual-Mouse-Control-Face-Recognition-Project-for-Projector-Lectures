@@ -133,8 +133,3 @@ class FaceRecognizer:
         pts  = np.array([[lm.x, lm.y] for lm in face_landmarks], dtype=np.float32)
         diag = np.linalg.norm(pts.max(axis=0) - pts.min(axis=0))
         return max(diag, 1e-4)
-
-    @staticmethod
-    def get_arm_vector(nose_pos, fingertip_pos, face_size):
-        raw_vec = fingertip_pos - nose_pos
-        return raw_vec / face_size

@@ -291,11 +291,6 @@ class PTZController:
         self._last_known_face_pos = None
         self._smoothed_pos        = None
 
-    def is_locked(self) -> bool:
-        """True whenever actively tracking (face-lock OR pose-search),
-        i.e. anything other than fully LOST."""
-        return self._state != STATE_LOST
-
     def get_state(self) -> str:
         return self._state
 

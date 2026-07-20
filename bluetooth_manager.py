@@ -24,7 +24,6 @@ Pi and inherit cursor control.
 
 import logging
 import threading
-import time
 
 log = logging.getLogger(__name__)
 

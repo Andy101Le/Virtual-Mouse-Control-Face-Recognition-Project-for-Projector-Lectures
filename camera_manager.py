@@ -41,11 +41,6 @@ class CameraManager:
 
         print(f"Camera: {self.description}")
 
-    def is_opened(self):
-        if self._picam is not None:
-            return True
-        return self._cap.isOpened()
-
     def read(self):
         if self._picam is not None:
             return True, self._picam.capture_array()
