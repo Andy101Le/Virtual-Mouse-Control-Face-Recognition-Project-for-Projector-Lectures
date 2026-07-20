@@ -18,7 +18,8 @@ import os
 import sqlite3
 import numpy as np
 
-DATABASE_NAME         = "login_system.db"
+_SCRIPT_DIR           = os.path.dirname(os.path.abspath(__file__))
+DATABASE_NAME         = os.path.join(_SCRIPT_DIR, "login_system.db")
 RECOGNITION_THRESHOLD = 0.82   # cosine similarity; above this → recognised
 UNKNOWN_LABEL         = "UNKNOWN"
 AUTH_FRAMES_NEEDED    = 10     # consecutive recognised frames before authenticated
