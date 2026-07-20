@@ -350,6 +350,8 @@ def face_cancel():
 @login_required
 def face_clear():
     db.clear_face_embedding(current_user())
+    if gesture.auth is not None:
+        gesture.auth.face_rec.reload_db()
     return jsonify(ok=True)
 
 
@@ -425,6 +427,8 @@ def admin_user_toggle():
 @admin_required
 def admin_clear_face():
     db.clear_face_embedding((request.json or {}).get("username"))
+    if gesture.auth is not None:
+        gesture.auth.face_rec.reload_db()
     return jsonify(ok=True)
 
 
