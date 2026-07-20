@@ -43,6 +43,8 @@ from ptz_manual import ManualPTZ, MODE_AUTO, MODE_MANUAL
 from gesture_session import GestureSession
 
 logging.basicConfig(level=logging.INFO,
+
+
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger(__name__)
 

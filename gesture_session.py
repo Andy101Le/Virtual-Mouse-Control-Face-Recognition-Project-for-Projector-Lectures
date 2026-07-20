@@ -410,10 +410,12 @@ class GestureSession:
 
     def set_zoom_cap(self, max_zoom):
         """
-        Raise/lower the digital zoom ceiling from the web slider.
-        Note the control-zone cap still applies on top of this — zoom can
-        never crop tighter than the user's reachable arm range, so setting
-        this above ~1.43x has no visible effect at the default CAM_MARGIN.
+        Raise/lower the absolute digital zoom ceiling from the web slider.
+        The arm-reach control-zone cap still applies on top of this, but it
+        is now distance-adaptive (relaxes toward ZoomWebcamController.
+        FAR_MAX_ZOOM as the subject moves away), so raising this ceiling
+        DOES take visible effect at range — it governs how tightly a
+        distant presenter can be framed.
         """
         if self.zoom:
             self.zoom.MAX_ZOOM = float(max_zoom)

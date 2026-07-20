@@ -59,9 +59,15 @@ class ZoomWebcamController:
     ZOOM_IN_SMOOTH  = 0.14
     ZOOM_OUT_SMOOTH = 0.07
     PAN_SMOOTH      = 0.12
-    MAX_ZOOM        = 2.5    # absolute ceiling, lowered from the original 5.0x
-                              # so a tight torso/face region alone can't zoom in
-                              # further than is comfortable for arm-reach gestures
+    MAX_ZOOM        = 4.0    # absolute ceiling. Raised back up from 2.5 so a
+                              # distant subject can actually be framed tightly;
+                              # at CLOSE range the arm-reach control-zone cap
+                              # (see update()) still keeps zoom comfortable for
+                              # gestures, so this ceiling only bites far away.
+    FAR_MAX_ZOOM    = 3.5    # how far the distance-adaptive control-zone cap is
+                              # allowed to relax once the subject is far
+                              # (far_factor→1). Up close the cap stays pinned at
+                              # the strict control-zone value; see update().
     VIS_THRESH      = 0.5
 
     # ── Fallback framing when the original head-to-hip region isn't visible ─
@@ -86,23 +92,19 @@ class ZoomWebcamController:
         # margin=0.15 means the middle 70% of the frame is the control zone,
         # so zoom must never exceed 1 / (1 - 2*margin) ≈ 1.43x.
         #
-        # Known trade-off (kept intentionally): at that cap, crop size
-        # exactly equals the control zone's raw size, so the box necessarily
-        # fills the ENTIRE display — it can't be framed any tighter without
-        # cropping part of the reachable area out of view. Since normal
-        # working distance usually wants noticeably more zoom than 1.43x,
-        # the system saturates at the cap almost immediately and stays
-        # there — the control-zone box will visibly resize only when the
-        # person is far enough away that their natural framing zoom is
-        # itself below the cap (roughly: box grows from ~70% of the frame
-        # at zoom=1.0 up to 100% at zoom=cap, then stays pinned at 100%
-        # for anything closer). This is the correct, expected result of
-        # guaranteeing full arm-reach visibility — not a bug — but it does
-        # mean "dynamic-looking" resizing is mostly only visible from far
-        # away. To trade the guarantee for a wider visible dynamic range,
-        # raise MAX_ZOOM and pass control_zone_margin=None instead (the
-        # box will then resize more noticeably, but at high zoom part of
-        # it may be cropped out of view).
+        # This cap is the FLOOR of a distance-adaptive range, not a hard
+        # ceiling: update() holds zoom at exactly this value while the
+        # subject is close (so their full arm reach stays visible for
+        # gestures), then smoothly relaxes it toward FAR_MAX_ZOOM as they
+        # move away — a distant subject's reachable area occupies only a
+        # small patch of the frame, so cropping tighter than the raw
+        # control zone no longer cuts their real reach out of view. That
+        # keeps a far-away presenter framed tightly (the original problem
+        # a fixed 1.43x cap could never solve) without sacrificing close-
+        # range gesture room. See the eff_cap logic in update() and the
+        # per-axis clamp guard in apply(). Pass control_zone_margin=None to
+        # disable the arm-reach cap entirely (zoom then governed only by
+        # MAX_ZOOM, but part of the reach may be cropped at high zoom).
         self.control_zone_margin = control_zone_margin
         if control_zone_margin is not None and 0 < control_zone_margin < 0.5:
             self.control_zone_zoom_cap = 1.0 / (1.0 - 2 * control_zone_margin)
@@ -196,7 +198,17 @@ class ZoomWebcamController:
 
         target_zoom = min(zoom_for_height, fit_zoom_h, fit_zoom_w, self.MAX_ZOOM)
         if self.control_zone_zoom_cap is not None:
-            target_zoom = min(target_zoom, self.control_zone_zoom_cap)
+            # Distance-adaptive arm-reach cap. Up close (far_factor≈0) we hold
+            # the strict control-zone cap so the user's outstretched arm stays
+            # fully on screen for gesture control. As the subject recedes
+            # (far_factor→1) their reachable area shrinks to a small patch of
+            # the frame, so we smoothly relax the cap toward FAR_MAX_ZOOM —
+            # letting the camera stay tight on a distant presenter without
+            # actually cropping their (now much smaller) real reach out of view.
+            eff_cap = self.control_zone_zoom_cap + far_factor * (
+                max(self.FAR_MAX_ZOOM, self.control_zone_zoom_cap)
+                - self.control_zone_zoom_cap)
+            target_zoom = min(target_zoom, eff_cap)
         target_zoom = max(target_zoom, 1.0)
         smooth = self.ZOOM_IN_SMOOTH if target_zoom > self.zoom else self.ZOOM_OUT_SMOOTH
         self.zoom += (target_zoom - self.zoom) * smooth
@@ -245,10 +257,19 @@ class ZoomWebcamController:
             # zoom cap, it shouldn't actually change anything.
             cz_x1, cz_y1 = self.control_zone_margin * w, self.control_zone_margin * h
             cz_x2, cz_y2 = w - cz_x1, h - cz_y1
-            x1 = min(x1, cz_x1)
-            x1 = max(x1, cz_x2 - crop_w)
-            y1 = min(y1, cz_y1)
-            y1 = max(y1, cz_y2 - crop_h)
+            cz_w,  cz_h  = cz_x2 - cz_x1, cz_y2 - cz_y1
+            # Only pin the crop to contain the control zone while the crop is
+            # actually wider/taller than the zone. Once the distance-adaptive
+            # cap lets zoom crop TIGHTER than the control zone (far-subject
+            # case), these constraints would flip (min-bound > max-bound) and
+            # shove the crop into a corner — so we skip them per-axis and keep
+            # the person-centered crop instead, then clamp to frame bounds.
+            if crop_w >= cz_w:
+                x1 = min(x1, cz_x1)
+                x1 = max(x1, cz_x2 - crop_w)
+            if crop_h >= cz_h:
+                y1 = min(y1, cz_y1)
+                y1 = max(y1, cz_y2 - crop_h)
             x1 = max(0, min(x1, w - crop_w))
             y1 = max(0, min(y1, h - crop_h))
 
