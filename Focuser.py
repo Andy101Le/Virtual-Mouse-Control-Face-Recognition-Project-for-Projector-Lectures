@@ -29,24 +29,6 @@ class Focuser:
     CHIP_I2C_ADDR = 0x0C
     BUSY_REG_ADDR = 0x04
 
-    # starting_point = [
-    #     17320, 13870, 10470,
-    #     7820, 5470, 3720,
-    #     2320, 1220, 370,
-    #     0, 0, 0, 0,
-    #     0, 0, 0, 0,
-    #     0, 0, 0, 0
-    # ]
-    
-    # end_point = [
-    #     20000, 20000, 17370,
-    #     14470, 12170, 10270,
-    #     8770, 7670, 6820,
-    #     5970, 5520, 5220,
-    #     4970, 4820, 4770,
-    #     4820, 4870, 5020,
-    #     5270, 5520, 5770
-    # ]
     starting_point =     [
         10000, 10000, 10000, 
         10720, 8070, 5970, 
@@ -91,10 +73,6 @@ class Focuser:
         while self.isBusy() and count < (5 / 0.01):
             count += 1
             time.sleep(0.01)
-        # if count >= (5 / 0.01):
-        #     print "wait timeout."
-        # elif count != 0:
-        #     print "wait time = %lf"%(time.time() - begin)
 
     OPT_BASE    = 0x1000
     OPT_FOCUS   = OPT_BASE | 0x01
