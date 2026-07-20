@@ -3,12 +3,28 @@
 .idea/
 __pycache__/
 *.pyc
+*.swp
 .claude/settings.local.json
 
-# Model + data binaries (too large / regenerable — keep out of git)
+# Runtime logs
+/focuser-logs/
+
+# Trained model binaries (regenerable from source assets below — keep out of git)
 /*.h5
+
+# Source .task model files: blanket-ignore, then allow the three this
+# project actually needs (fetched by download_models.py if missing)
 /*.task
+!/hand_landmarker.task
+!/face_landmarker.task
+!/pose_landmarker_lite.task
+
+# Source .csv training data: blanket-ignore, then allow the dataset used
+# by train_gesture_model.py
 /*.csv
+!/landmark_dataset.csv
+
+# Runtime-generated user/auth data — never commit
 /*.pki
 /*.db
 /*.pkl
