@@ -7,7 +7,7 @@ __pycache__/
 .claude/settings.local.json
 
 # Runtime logs
-/focuser-logs/
+/focuser-logs
 
 # Trained model binaries (regenerable from source assets below — keep out of git)
 /*.h5
