@@ -172,7 +172,7 @@ if [ "$NEEDS_RELOAD" = "1" ]; then
     sudo systemctl daemon-reload
 fi
 
-sudo systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
+sudo systemctl enable "$SERVICE_NAME"
 
 if systemctl is-active --quiet "$SERVICE_NAME"; then
     if [ "$NEEDS_RELOAD" = "1" ]; then
@@ -191,7 +191,7 @@ echo
 echo "======================================================================"
 echo "Install complete."
 echo
-sudo systemctl status "$SERVICE_NAME" --no-pager -l | head -10
+sudo systemctl status "$SERVICE_NAME" --no-pager -l | head -10 || true
 echo
 echo "Web UI:       http://<this Pi's address>:8080"
 echo "Live logs:    sudo journalctl -u $SERVICE_NAME -f"
