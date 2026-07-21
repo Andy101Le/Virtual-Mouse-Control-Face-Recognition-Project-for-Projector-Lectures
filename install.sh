@@ -126,20 +126,16 @@ fi
 echo
 
 # ── 6. systemd service for the app itself ────────────────────────────────────
-# Root is required here: bluetooth_hid.py binds raw L2CAP sockets on PSM
-# 17/19, which needs CAP_NET_BIND_SERVICE-equivalent privilege. Confirmed on
-# real hardware — running as a regular user (even in the bluetooth group)
-# fails with "Permission denied" on the bind call; running as root works.
-# See bluetooth_hid.py's own module docstring for the same statement.
-#
-# If you want to try a less-privileged alternative later, AmbientCapabilities
-# is the systemd mechanism for it (untested here — plain group membership in
-# "bluetooth" was NOT sufficient in testing). It would replace User=root below
-# with something like:
-#   User=<your invoking user>
-#   Group=<your invoking user's primary group>
-#   AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW
-# Verify pairing still actually works before relying on it.
+# bluetooth_hid.py binds raw L2CAP sockets on PSM 17/19, which needs
+# CAP_NET_BIND_SERVICE-equivalent privilege. Plain "bluetooth" group
+# membership is NOT sufficient for that bind (confirmed on hardware: fails
+# with "Permission denied") -- but running as root isn't actually necessary
+# either. AmbientCapabilities grants just the specific capabilities needed
+# to a normal, non-root user account. Verified end-to-end on real hardware:
+# HID profile registration, the PSM 17/19 bind, pairing, device trust, and
+# account claiming all work running this way -- no root involved.
+RUN_GROUP="$(id -gn "$RUN_USER")"
+
 echo "-- Installing systemd service --"
 
 NEW_SERVICE_CONTENT="[Unit]
@@ -149,7 +145,10 @@ Wants=bluetooth.target
 
 [Service]
 Type=simple
-User=root
+User=$RUN_USER
+Group=$RUN_GROUP
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW
 WorkingDirectory=$REPO_ROOT
 ExecStart=$VENV_PY $REPO_ROOT/web_server.py
 Restart=on-failure
