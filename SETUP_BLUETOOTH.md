@@ -35,33 +35,37 @@ The empty `ExecStart=` line is required — it clears the unit's
 original `ExecStart` before the second line sets the replacement;
 without it, systemd tries to run both and fails.
 
-## Why the app needs root
+## Why the app needs CAP_NET_BIND_SERVICE and CAP_NET_RAW (not root)
 
 `bluetooth_hid.py` binds raw L2CAP sockets on PSM 17 and 19 directly
 (not through BlueZ's socket-passing mechanism), which needs
 `CAP_NET_BIND_SERVICE`-equivalent privilege for these low,
-well-known-range PSM numbers. This was verified directly on hardware:
+well-known-range PSM numbers. Verified directly on hardware:
 
-- Running as a regular user — even one already in the `bluetooth`
-  group — fails at the bind call with `PermissionError: [Errno 13]
-  Permission denied`. Group membership affects BlueZ's D-Bus/polkit
-  policy, not this kernel-level socket permission check.
-- Running as root works end-to-end: the HID profile registers and
-  both PSM sockets bind successfully.
+- Running as a regular user with no special capabilities — even one
+  already in the `bluetooth` group — fails at the bind call with
+  `PermissionError: [Errno 13] Permission denied`. Group membership
+  affects BlueZ's D-Bus/polkit policy, not this kernel-level socket
+  permission check.
+- Running as a normal (non-root) user with systemd's
+  `AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW` set on the
+  service works end-to-end: HID profile registration, the PSM 17/19
+  bind, pairing, device trust, and account claiming were all confirmed
+  working this way, with no root involved at any point.
 
-So the app is run with `sudo` (manually) or `User=root` (in
-`install.sh`'s systemd unit). If you want to try a less-privileged
-alternative, systemd's `AmbientCapabilities=CAP_NET_BIND_SERVICE
-CAP_NET_RAW` is the mechanism for it — this hasn't been verified to
-work, so treat it as an experiment and confirm pairing still functions
-before relying on it.
+`install.sh` sets this up by default (`User=<invoking user>` +
+`AmbientCapabilities`). If running manually rather than through
+`install.sh` or a systemd unit, there's no equivalent of
+`AmbientCapabilities` for a plain shell command — running with `sudo`
+is the manual-mode equivalent.
 
 ## Pairing Flow
 
 1. Make sure the `--noplugin=input` override above is in place and
    `bluetoothd` has been restarted since.
-2. Start the app with root (see `setup/virt-env-setup.md` or
-   `install.sh`). Startup logs should show:
+2. Start the app (see `setup/virt-env-setup.md` for manual/`sudo` use,
+   or `install.sh` for the systemd/`AmbientCapabilities` path). Startup
+   logs should show:
    ```
    HID profile registered with BlueZ
    HID L2CAP sockets listening on PSM 17/19
@@ -92,8 +96,10 @@ Check with `systemctl status bluetooth` — the `Drop-In` line should
 list the override, and the process args should include
 `--noplugin=input`.
 
-**`Could not bind L2CAP PSM 17/19: Permission denied`** — the app
-isn't running as root. See "Why the app needs root" above.
+**`Could not bind L2CAP PSM 17/19: Permission denied`** — the process
+doesn't have `CAP_NET_BIND_SERVICE`/`CAP_NET_RAW`. Under `install.sh`'s
+systemd unit, check `AmbientCapabilities` is actually present in the
+unit file; running manually, use `sudo`.
 
 **Cursor doesn't move after a successful pairing** — this project
 sends absolute-position HID reports (mapping a fixed camera control
