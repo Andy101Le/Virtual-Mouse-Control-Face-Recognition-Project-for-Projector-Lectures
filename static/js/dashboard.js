@@ -2,21 +2,44 @@
 
 const $ = (id) => document.getElementById(id);
 
-async function post(url, body) {
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body || {}),
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
-  return data;
+async function post(url, body, retries = 0) {
+  for (;;) {
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body || {}),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const err = new Error(data.error || `Request failed (${res.status})`);
+        err.status = res.status;
+        throw err;
+      }
+      return data;
+    } catch (e) {
+      /* A server response (has .status) is final. A network-level failure
+         ("Failed to fetch", no .status) may be the Pi's shared Wi-Fi/BT
+         radio stalling Wi-Fi during Bluetooth pairing — retry those. */
+      if (e.status !== undefined || retries-- <= 0) throw e;
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+  }
 }
 
 /* ── Live preview ────────────────────────────────────────────────────── */
 const socket = io();
 const img = $("preview");
 const placeholder = $("preview-placeholder");
+
+/* Closing the tab must register as a sign-out promptly: an abandoned
+   connection can take the whole Socket.IO ping timeout to die, and the
+   camera keeps tracking that entire time. pagehide also fires on
+   refresh/navigation, but the server's grace period absorbs those.
+   pageshow restores the socket when the page comes back from bfcache
+   (a manual disconnect() disables auto-reconnect). */
+addEventListener("pagehide", () => socket.disconnect());
+addEventListener("pageshow", (e) => { if (e.persisted) socket.connect(); });
 
 socket.on("preview_frame", (msg) => {
   img.src = "data:image/jpeg;base64," + msg.image;
@@ -64,6 +87,7 @@ function hasPairedDevice() {
 /* ── PTZ mode ────────────────────────────────────────────────────────── */
 const manualControls = () => [
   ...document.querySelectorAll(".dpad button"),
+  ...document.querySelectorAll(".step-picker button"),
   $("pan"), $("tilt"), $("hwzoom"),
 ].filter(Boolean);
 
@@ -92,13 +116,24 @@ function paintPTZ(status) {
 $("mode-auto").onclick   = () => setMode("auto").catch(alertErr);
 $("mode-manual").onclick = () => setMode("manual").catch(alertErr);
 
+// D-pad arrows move 1° (the finest step the PTZ board accepts) multiplied
+// by the selected step size — 1° for fine aiming, 5°/15° for coarse moves.
+let nudgeStep = 1;
+document.querySelectorAll(".step-picker button[data-step]").forEach((btn) => {
+  btn.onclick = () => {
+    nudgeStep = Number(btn.dataset.step);
+    document.querySelectorAll(".step-picker button[data-step]")
+      .forEach((b) => b.setAttribute("aria-pressed", String(b === btn)));
+  };
+});
+
 document.querySelectorAll(".dpad button[data-pan], .dpad button[data-tilt]")
   .forEach((btn) => {
     btn.onclick = async () => {
       try {
         const data = await post("/api/ptz/nudge", {
-          pan:  Number(btn.dataset.pan  || 0),
-          tilt: Number(btn.dataset.tilt || 0),
+          pan:  Number(btn.dataset.pan  || 0) * nudgeStep,
+          tilt: Number(btn.dataset.tilt || 0) * nudgeStep,
         });
         paintPTZ(data.status);
       } catch (e) { alertErr(e); }
@@ -208,7 +243,7 @@ function stopPolling() {
 
 $("pair-start").onclick = async () => {
   try {
-    await post("/api/bt/pair/start");
+    await post("/api/bt/pair/start", null, 3);
     showPane("pair-waiting");
     startPolling();
   } catch (e) {
@@ -225,8 +260,13 @@ $("pair-cancel").onclick = async () => {
 
 $("pair-yes").onclick = async () => {
   try {
-    await post("/api/bt/pair/confirm", { approve: true });
-  } catch (e) { alertErr(e); }
+    await post("/api/bt/pair/confirm", { approve: true }, 5);
+  } catch (e) {
+    /* 409 = "no pairing request waiting": an earlier attempt whose
+       response got lost already confirmed it — let the status polling
+       render the real outcome instead of alarming the user. */
+    if (e.status !== 409) alertErr(e);
+  }
 };
 
 $("pair-no").onclick = async () => {

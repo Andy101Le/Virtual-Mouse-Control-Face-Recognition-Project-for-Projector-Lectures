@@ -5,6 +5,9 @@ __pycache__/
 *.pyc
 .claude/settings.local.json
 
+# Saved Claude Code chat transcripts — local record only, never pushed
+chat_logs/
+
 # Model + data binaries (too large / regenerable — keep out of git)
 /*.h5
 /*.task
