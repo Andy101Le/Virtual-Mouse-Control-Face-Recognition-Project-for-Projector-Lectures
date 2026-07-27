@@ -191,6 +191,20 @@ def bt_pair_start():
     return jsonify(ok=True, status=btmgr.status())
 
 
+@app.post("/api/bt/pair/start_permanent")
+@login_required
+def bt_pair_start_permanent():
+    if not btmgr.available:
+        return jsonify(error="Bluetooth isn't available on this host. "
+                             "Install python3-dbus and python3-gi."), 503
+    try:
+        btmgr.begin_permanent_pairing()
+    except Exception as e:
+        log.exception("begin_permanent_pairing failed")
+        return jsonify(error=str(e)), 500
+    return jsonify(ok=True, status=btmgr.status())
+
+
 @app.post("/api/bt/pair/confirm")
 @login_required
 def bt_pair_confirm():
@@ -223,12 +237,29 @@ def bt_pair_cancel():
 @app.get("/api/bt/status")
 @login_required
 def bt_status():
+    pairing = btmgr.status()
+
+    # With auto-accept (Just Works) pairing, there's no separate "Confirm"
+    # click to claim the device for an account anymore — this poll is what
+    # notices a newly-completed pairing and claims it for whoever's logged
+    # in and watching the dashboard. needs_claim is a one-shot flag set by
+    # _auto_approve() and cleared here, so this only fires once per pairing
+    # event even though the dashboard polls every second.
+    if pairing["needs_claim"] and pairing["last_paired"]:
+        mac = pairing["last_paired"]
+        name = next((d["name"] for d in btmgr.list_paired_devices()
+                     if d["mac"].upper() == mac.upper()), "Paired computer")
+        db.add_bt_device(mac, name, current_user())
+        btmgr.mark_claimed()
+        pairing["needs_claim"] = False
+        log.info("Device %s claimed by %s", mac, current_user())
+
     paired = btmgr.list_paired_devices() if btmgr.available else []
     owners = {d["mac"].upper(): d["username"] for d in db.get_bt_devices()}
     for d in paired:
         d["owner"] = owners.get(d["mac"].upper())
     return jsonify(
-        pairing=btmgr.status(),
+        pairing=pairing,
         devices=paired,
         hid_connected=hid.connected,
         hid_peer=hid.peer_address,
