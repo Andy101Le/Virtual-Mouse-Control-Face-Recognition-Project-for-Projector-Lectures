@@ -15,11 +15,16 @@ Uses BlueZ over D-Bus:
   - org.bluez.AgentManager1 → register a pairing agent
   - org.bluez.Device1   → enumerate, trust, and remove paired devices
 
-The agent runs in DisplayYesNo mode: BlueZ hands us a 6-digit passkey,
-we surface it to the web UI so the user can confirm it matches what
-their laptop shows, then we confirm. That's a real security boundary —
-auto-accepting any pairing request would let a passerby pair with the
-Pi and inherit cursor control.
+The agent runs in NoInputNoOutput mode ("Just Works" pairing): BlueZ
+does not ask for a passkey or a confirmation click, any device that
+finds the Pi while it's discoverable pairs immediately and
+automatically. This is a deliberate choice, not an oversight — it
+trades away the security boundary a passkey/confirmation step
+provides (a passerby within Bluetooth range while discovery is on can
+pair and inherit cursor control) for zero-friction "walk up and pair
+like a smart accessory" behavior. Keep discovery off except when
+actually expecting a device to pair, unless the permanent-discovery
+mode is deliberately enabled.
 """
 
 import logging
@@ -50,7 +55,7 @@ class PairingState:
     """Snapshot of what the web UI needs to render the pairing panel."""
     IDLE       = "idle"
     PAIRABLE   = "pairable"     # discoverable, waiting for a host
-    CONFIRMING = "confirming"   # passkey shown, waiting for user confirm
+    CONFIRMING = "confirming"   # kept for a possible future manual-approval mode; unused while auto-accept is on
     PAIRED     = "paired"
     FAILED     = "failed"
 
@@ -59,10 +64,13 @@ if _HAS_DBUS:
 
     class _Agent(dbus.service.Object):
         """
-        BlueZ calls into this when a host tries to pair. We don't
-        auto-accept: RequestConfirmation parks the request and surfaces
-        the passkey, and the pairing only completes once the logged-in
-        user confirms it in the web UI.
+        BlueZ calls into this when a host tries to pair. With the
+        NoInputNoOutput capability registered below, BlueZ negotiates Just
+        Works pairing and calls RequestAuthorization (no passkey involved)
+        rather than RequestConfirmation — we auto-approve immediately, no
+        web UI round-trip. RequestConfirmation is kept as a defensive
+        fallback (auto-approving too) in case a given remote device somehow
+        still negotiates numeric-comparison pairing.
         """
 
         def __init__(self, bus, path, manager):
@@ -75,21 +83,15 @@ if _HAS_DBUS:
 
         @dbus.service.method(AGENT_IFACE, in_signature="ou", out_signature="")
         def RequestConfirmation(self, device, passkey):
-            log.info("Pairing confirmation requested for %s (passkey %06d)",
-                     device, passkey)
-            confirmed = self._manager._await_user_confirmation(
-                str(device), f"{passkey:06d}")
-            if not confirmed:
-                raise dbus.DBusException(
-                    "org.bluez.Error.Rejected",
-                    "User rejected pairing in the web UI")
+            log.info("Pairing confirmation requested for %s (passkey %06d) "
+                     "— auto-approving", device, passkey)
+            self._manager._auto_approve(str(device))
 
         @dbus.service.method(AGENT_IFACE, in_signature="o", out_signature="")
         def RequestAuthorization(self, device):
-            confirmed = self._manager._await_user_confirmation(str(device), None)
-            if not confirmed:
-                raise dbus.DBusException(
-                    "org.bluez.Error.Rejected", "User rejected pairing")
+            log.info("Pairing authorization requested for %s — auto-approving",
+                      device)
+            self._manager._auto_approve(str(device))
 
         @dbus.service.method(AGENT_IFACE, in_signature="os", out_signature="")
         def AuthorizeService(self, device, uuid):
@@ -119,6 +121,9 @@ class BluetoothManager:
         self._pending = None          # {'device','passkey','event','approved'}
         self._last_paired_mac = None
         self._error = None
+        self._permanent = False       # True while "always discoverable" mode is on
+        self._needs_claim = False     # True once auto-approved but not yet
+                                       # associated with a logged-in account
 
     @property
     def available(self):
@@ -148,8 +153,22 @@ class BluetoothManager:
         agent_mgr = dbus.Interface(
             self._bus.get_object(BLUEZ_SERVICE, "/org/bluez"),
             "org.bluez.AgentManager1")
-        agent_mgr.RegisterAgent(AGENT_PATH, "DisplayYesNo")
+        agent_mgr.RegisterAgent(AGENT_PATH, "NoInputNoOutput")
         agent_mgr.RequestDefaultAgent(AGENT_PATH)
+
+        # Pure Just Works pairing (no MITM requirement on either side) can
+        # complete without BlueZ ever calling the agent at all — there's
+        # nothing to display or confirm, so it just bonds silently.
+        # Confirmed on real hardware: paired successfully, zero
+        # RequestAuthorization/RequestConfirmation calls. That means
+        # _auto_approve() (which does the trust + claim bookkeeping) can't
+        # be relied on as the only trigger — watch Device1's own Paired
+        # property directly so trust/claim still happen in that case.
+        self._bus.add_signal_receiver(
+            self._on_properties_changed,
+            signal_name="PropertiesChanged",
+            dbus_interface=PROPS_IFACE,
+            path_keyword="path")
 
         # BlueZ delivers agent callbacks on a GLib main loop, so it needs
         # its own thread — the Flask/SocketIO server owns the main one.
@@ -162,13 +181,16 @@ class BluetoothManager:
     # ── Pairing flow ────────────────────────────────────────────────────────
     def begin_pairing(self, timeout_s=180):
         """
-        Make the Pi discoverable so the user's laptop can find it. Called
-        when a logged-in user clicks "Pair a computer".
+        Make the Pi discoverable for a limited window so a nearby laptop
+        can find and pair with it. Called when a logged-in user clicks
+        "Pair a computer".
         """
         with self._lock:
             self._state = PairingState.PAIRABLE
             self._error = None
             self._last_paired_mac = None
+            self._needs_claim = False
+            self._permanent = False
 
         self._adapter_props.Set(ADAPTER_IFACE, "DiscoverableTimeout",
                                 dbus.UInt32(timeout_s))
@@ -178,15 +200,70 @@ class BluetoothManager:
         self._adapter_props.Set(ADAPTER_IFACE, "Pairable", dbus.Boolean(True))
         log.info("Discoverable for %ds", timeout_s)
 
+    def begin_permanent_pairing(self):
+        """
+        Make the Pi discoverable indefinitely (DiscoverableTimeout=0 means
+        "no timeout" to BlueZ) — any device that finds it pairs
+        automatically via Just Works, with no time limit and no per-device
+        action needed on this end. Stays on until cancel_pairing() is
+        called explicitly.
+        """
+        with self._lock:
+            self._state = PairingState.PAIRABLE
+            self._error = None
+            self._last_paired_mac = None
+            self._needs_claim = False
+            self._permanent = True
+
+        self._adapter_props.Set(ADAPTER_IFACE, "DiscoverableTimeout", dbus.UInt32(0))
+        self._adapter_props.Set(ADAPTER_IFACE, "PairableTimeout", dbus.UInt32(0))
+        self._adapter_props.Set(ADAPTER_IFACE, "Discoverable", dbus.Boolean(True))
+        self._adapter_props.Set(ADAPTER_IFACE, "Pairable", dbus.Boolean(True))
+        log.info("Discoverable permanently (no timeout)")
+
     def cancel_pairing(self):
         with self._lock:
             self._state = PairingState.IDLE
+            self._permanent = False
             self._cancel_confirmation_locked()
         try:
             self._adapter_props.Set(ADAPTER_IFACE, "Discoverable", dbus.Boolean(False))
             self._adapter_props.Set(ADAPTER_IFACE, "Pairable", dbus.Boolean(False))
         except Exception:
             log.exception("Failed to clear discoverable")
+
+    def _on_properties_changed(self, interface, changed, invalidated, path=None):
+        """
+        Catches devices that pair via pure Just Works, where BlueZ never
+        calls the agent at all (see the note in start()). Any device
+        whose Device1.Paired flips to True gets the same trust + claim
+        treatment _auto_approve() gives devices that DO go through the
+        agent — same outcome, different trigger.
+        """
+        if interface != DEVICE_IFACE or path is None:
+            return
+        if bool(changed.get("Paired", False)):
+            log.info("Device paired (no agent callback involved): %s", path)
+            self._auto_approve(path)
+
+    def _auto_approve(self, device_path):
+        """
+        Approves a pairing request immediately, with no web UI round-trip.
+        This is the whole point of Just Works mode — see the module
+        docstring for the security tradeoff this accepts.
+        """
+        with self._lock:
+            mac = self._mac_from_path(device_path)
+            self._state = PairingState.PAIRED
+            self._last_paired_mac = mac
+            self._needs_claim = True
+        self._trust_device(device_path)
+
+    def mark_claimed(self):
+        """Called once the web layer has associated last_paired_mac with an
+        account, so status() stops reporting it as needing a claim."""
+        with self._lock:
+            self._needs_claim = False
 
     def _await_user_confirmation(self, device_path, passkey, timeout_s=60):
         """
@@ -312,6 +389,8 @@ class BluetoothManager:
                 "pending":     pending,
                 "last_paired": self._last_paired_mac,
                 "error":       self._error,
+                "permanent":   self._permanent,
+                "needs_claim": self._needs_claim,
             }
 
     def stop(self):
