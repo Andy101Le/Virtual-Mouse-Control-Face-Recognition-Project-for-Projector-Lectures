@@ -174,23 +174,53 @@ function showPane(id) {
 
 let pollTimer = null;
 
+// Server-side pairing state stays "paired" indefinitely once ANY device has
+// ever paired — it only resets on the next begin_pairing()/cancel_pairing()
+// call. So "paired" is not a one-time event we can react to just by seeing
+// it; it's only worth reloading for if we actually watched pairing happen
+// during this page's lifetime, not merely because that's the leftover state
+// from a completed pairing that predates this page load.
+let sawInProgress = false;
+
 async function pollPairing() {
   try {
     const data = await (await fetch("/api/bt/status")).json();
     const p = data.pairing;
 
-    if (p.state === "confirming" && p.pending) {
+    if (p.permanent) {
+      // Always-discoverable mode has no end state to poll toward — new
+      // devices can keep pairing indefinitely, so this pane just stays up
+      // until "Stop discovery" is clicked, instead of reloading per pair.
+      sawInProgress = true;
+      $("pair-waiting-msg").innerHTML = "Always discoverable. Open " +
+        "Bluetooth settings on your computer and connect to " +
+        "<b>Gesture Touchpad</b> any time.";
+      showPane("pair-waiting");
+      startPolling();
+    } else if (p.state === "confirming" && p.pending) {
+      sawInProgress = true;
       $("passkey").textContent = p.pending.passkey || "confirm on device";
       showPane("pair-confirm");
+      startPolling();
     } else if (p.state === "pairable") {
+      sawInProgress = true;
+      $("pair-waiting-msg").innerHTML = "Open Bluetooth settings on your " +
+        "computer and connect to <b>Gesture Touchpad</b>.";
       showPane("pair-waiting");
+      startPolling();
     } else if (p.state === "paired") {
       stopPolling();
-      location.reload();   // simplest way to re-render the device list
+      if (sawInProgress) {
+        location.reload();   // simplest way to re-render the device list
+      } else {
+        showPane("pair-idle");   // stale "paired" from before this page loaded
+      }
     } else if (p.state === "failed") {
       stopPolling();
       $("pair-error-msg").textContent = p.error || "Pairing didn't complete.";
       showPane("pair-error");
+    } else {
+      showPane("pair-idle");
     }
   } catch (e) {
     /* transient — keep polling */
@@ -198,7 +228,7 @@ async function pollPairing() {
 }
 
 function startPolling() {
-  stopPolling();
+  if (pollTimer) return;   // already running — avoid stacking intervals
   pollTimer = setInterval(pollPairing, 1000);
 }
 function stopPolling() {
@@ -206,11 +236,25 @@ function stopPolling() {
   pollTimer = null;
 }
 
+// Resume the correct pane on page load — e.g. permanent discovery left on
+// from an earlier visit, or a 2-minute window still running — rather than
+// always defaulting to the idle pane regardless of actual server state.
+pollPairing();
+
 $("pair-start").onclick = async () => {
   try {
     await post("/api/bt/pair/start");
-    showPane("pair-waiting");
-    startPolling();
+    await pollPairing();
+  } catch (e) {
+    $("pair-error-msg").textContent = e.message;
+    showPane("pair-error");
+  }
+};
+
+$("pair-start-permanent").onclick = async () => {
+  try {
+    await post("/api/bt/pair/start_permanent");
+    await pollPairing();
   } catch (e) {
     $("pair-error-msg").textContent = e.message;
     showPane("pair-error");

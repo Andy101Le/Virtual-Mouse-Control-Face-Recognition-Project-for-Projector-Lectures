@@ -112,18 +112,22 @@
     <div id="pair-idle">
       <p style="font-size:.88rem;color:var(--ink-muted)">
         Pair the computer you want to control. The Pi appears in its Bluetooth
-        settings as <b>Gesture Touchpad</b>.
+        settings as <b>Gesture Touchpad</b> and pairs automatically — no code
+        to confirm.
       </p>
-      <button id="pair-start">Pair a computer</button>
+      <div style="display:flex;gap:.5rem;flex-wrap:wrap">
+        <button id="pair-start">Discoverable for 2 minutes</button>
+        <button class="secondary" id="pair-start-permanent">Always discoverable</button>
+      </div>
     </div>
 
     <div id="pair-waiting" hidden>
-      <p style="font-size:.88rem">
+      <p style="font-size:.88rem" id="pair-waiting-msg">
         Open Bluetooth settings on your computer and connect to
         <b>Gesture Touchpad</b>.
       </p>
       <progress></progress>
-      <button class="secondary" id="pair-cancel">Cancel</button>
+      <button class="secondary" id="pair-cancel">Stop discovery</button>
     </div>
 
     <div id="pair-confirm" hidden>
