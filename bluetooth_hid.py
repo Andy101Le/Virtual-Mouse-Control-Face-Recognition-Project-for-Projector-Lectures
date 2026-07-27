@@ -178,13 +178,13 @@ def _sdp_record_xml():
     </sequence>
   </attribute>
   <attribute id="0x0100">
-    <text value="Gesture Touchpad" />
+    <text value="Galaxy Mouse" />
   </attribute>
   <attribute id="0x0101">
     <text value="Lecture gesture control virtual touchpad" />
   </attribute>
   <attribute id="0x0102">
-    <text value="Virtual Mouse Project" />
+    <text value="Galaxy Mouse Project" />
   </attribute>
   <attribute id="0x0200"><uint16 value="0x0100" /></attribute>
   <attribute id="0x0201"><uint16 value="0x0111" /></attribute>
@@ -272,11 +272,17 @@ class BluetoothHIDDevice:
         # first dbus.Boolean with "Expected a string or unicode object". Wrapping
         # it in dbus.Dictionary(..., signature="sv") forces each value to be
         # marshalled as a variant, which is what BlueZ actually wants.
+        # RequireAuthentication=True would demand an authenticated
+        # (MITM-protected) link, which Just Works pairing can never provide
+        # by definition — bluetooth_manager.py's agent is registered
+        # NoInputNoOutput specifically to get Just Works (no passkey), so
+        # this must be False or BlueZ ends up unable to satisfy both
+        # constraints at once and pairing stalls without completing.
         opts = dbus.Dictionary(
             {
                 "ServiceRecord":          dbus.String(_sdp_record_xml()),
                 "Role":                   dbus.String("server"),
-                "RequireAuthentication":  dbus.Boolean(True),
+                "RequireAuthentication":  dbus.Boolean(False),
                 "RequireAuthorization":   dbus.Boolean(False),
                 "AutoConnect":            dbus.Boolean(True),
             },
