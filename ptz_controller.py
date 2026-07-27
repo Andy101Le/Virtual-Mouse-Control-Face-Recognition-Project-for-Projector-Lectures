@@ -148,16 +148,30 @@ class PTZController:
         self.enabled     = enabled
         self.verbose     = verbose
 
-        if tilt_gpio_pin is not None:
-            # The Arducam board's tilt channel is dead (it ACKs OPT_MOTOR_Y
-            # writes but never drives the header) — route tilt pulses out a
-            # Pi GPIO pin instead. Pan/zoom/focus still go to the board.
-            from gpio_tilt import GpioTiltFocuser
-            self._focuser = GpioTiltFocuser(i2c_bus, tilt_pin=tilt_gpio_pin)
-            print(f"[PTZController] tilt servo driven from GPIO{tilt_gpio_pin} "
-                  f"(Arducam tilt channel bypassed)")
-        else:
-            self._focuser = Focuser(i2c_bus)
+        try:
+            if tilt_gpio_pin is not None:
+                # The Arducam board's tilt channel is dead (it ACKs
+                # OPT_MOTOR_Y writes but never drives the header) — route
+                # tilt pulses out a Pi GPIO pin instead. Pan/zoom/focus
+                # still go to the board.
+                from gpio_tilt import GpioTiltFocuser
+                self._focuser = GpioTiltFocuser(i2c_bus, tilt_pin=tilt_gpio_pin)
+                print(f"[PTZController] tilt servo driven from GPIO{tilt_gpio_pin} "
+                      f"(Arducam tilt channel bypassed)")
+            else:
+                self._focuser = Focuser(i2c_bus)
+        except Exception as e:
+            # No PTZ board on this I2C bus (missing smbus module, or no
+            # device answering at the expected address) — a Pi running
+            # without the PTZ hardware attached is a normal, supported
+            # setup, not a fatal error. Warn on the command line and run
+            # with PTZ tracking/nudging disabled instead of letting the
+            # exception take the whole process down.
+            print(f"[PTZController] WARNING: PTZ hardware not detected on "
+                  f"i2c bus {i2c_bus} ({e}). Disabling PTZ tracking and "
+                  f"manual controls; the rest of the app continues normally.")
+            self._focuser = None
+            self.enabled  = False
 
         # GPIO-driven tilt (GpioTiltFocuser) accepts fractional degrees —
         # the SG92R just follows whatever pulse width it's given. The
@@ -225,6 +239,9 @@ class PTZController:
         register indefinitely until something starts fresh from a sane
         number.
         """
+        if self._focuser is None:
+            self._targets = _Targets(90, 90)  # no hardware — safe-ish placeholder
+            return
         try:
             with self._io_lock:
                 mx_raw = self._focuser.get(Focuser.OPT_MOTOR_X)

@@ -22,7 +22,6 @@
     OR OTHER DEALINGS IN THE SOFTWARE.
 '''
 
-import sys
 import time
 class Focuser:
     bus = None
@@ -50,11 +49,12 @@ class Focuser:
 
 
     def __init__(self, bus):
-        try:
-            import smbus # sudo apt-get install python-smbus
-            self.bus = smbus.SMBus(bus)
-        except:
-            sys.exit(0)
+        # Let ImportError (smbus not installed) and OSError (no I2C device
+        # at this bus number) propagate to the caller instead of killing
+        # the whole process — PTZController is responsible for deciding
+        # what a missing focuser board means for the rest of the app.
+        import smbus  # sudo apt-get install python-smbus
+        self.bus = smbus.SMBus(bus)
         
     def read(self,chip_addr,reg_addr):
         value = self.bus.read_word_data(chip_addr,reg_addr)
