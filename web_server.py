@@ -30,6 +30,7 @@ import functools
 import logging
 import os
 import secrets
+import threading
 
 from flask import (Flask, render_template, request, redirect, url_for,
                    session, jsonify, flash)
@@ -59,16 +60,42 @@ socketio = SocketIO(app, async_mode="threading", cors_allowed_origins="*")
 db      = UserDatabase(DATABASE_NAME)
 hid     = BluetoothHIDDevice()
 btmgr   = BluetoothManager()
-ptz     = PTZController(active_user=None)
+
+# TILT_GPIO_PIN=18 routes tilt-servo pulses out that GPIO pin instead of
+# the Arducam board, whose tilt channel is dead — see gpio_tilt.py for
+# the diagnosis and wiring. Unset = drive the board as normal.
+_tilt_pin = os.environ.get("TILT_GPIO_PIN")
+ptz     = PTZController(active_user=None,
+                        tilt_gpio_pin=int(_tilt_pin) if _tilt_pin else None)
 manual  = ManualPTZ(ptz)
 gesture = GestureSession(db, hid, ptz, socketio)
 
 
 # ── Auth helpers ────────────────────────────────────────────────────────────
+# Sessions live in a signed cookie, so the server can't delete them when the
+# user simply closes the site. Instead each username has a sign-out epoch:
+# login stamps the current epoch into the cookie, and closing the last
+# dashboard tab bumps it, which retroactively invalidates every cookie that
+# user already holds. In-memory on purpose — after a server restart the
+# epoch resets to 0 and old cookies (epoch >= 0) stay valid, preserving the
+# existing sessions-survive-a-restart behaviour.
+_signout_epoch = {}
+
+
+def _session_valid():
+    user = session.get("user")
+    if user is None:
+        return False
+    if session.get("epoch", 0) < _signout_epoch.get(user, 0):
+        session.clear()   # cookie predates a close-tab sign-out — kill it
+        return False
+    return True
+
+
 def login_required(fn):
     @functools.wraps(fn)
     def wrapper(*a, **kw):
-        if "user" not in session:
+        if not _session_valid():
             return redirect(url_for("login", next=request.path))
         return fn(*a, **kw)
     return wrapper
@@ -77,7 +104,7 @@ def login_required(fn):
 def admin_required(fn):
     @functools.wraps(fn)
     def wrapper(*a, **kw):
-        if "user" not in session:
+        if not _session_valid():
             return redirect(url_for("login", next=request.path))
         if not session.get("is_admin"):
             return render_template("error.html",
@@ -94,7 +121,7 @@ def current_user():
 # ── Pages ───────────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
-    if "user" in session:
+    if _session_valid():
         return redirect(url_for("dashboard"))
     return redirect(url_for("login"))
 
@@ -113,6 +140,7 @@ def login():
         if row:
             session["user"]     = row["username"]
             session["is_admin"] = bool(row["is_admin"])
+            session["epoch"]    = _signout_epoch.get(row["username"], 0)
             gesture.set_active_user(row["username"])
             return redirect(request.args.get("next") or url_for("dashboard"))
         flash("That username and password don't match an account.", "error")
@@ -144,6 +172,10 @@ def signup():
 
 @app.route("/logout")
 def logout():
+    # Stop following the person who just signed out IMMEDIATELY — the
+    # recogniser forgets its target, so tracking/gestures stop even if a
+    # stale dashboard tab is still streaming the preview somewhere.
+    gesture.set_active_user(None)
     session.clear()
     return redirect(url_for("login"))
 
@@ -205,6 +237,40 @@ def bt_pair_start_permanent():
     return jsonify(ok=True, status=btmgr.status())
 
 
+def _claim_last_paired(reassign):
+    """
+    Attach the most recently paired MAC to the logged-in account (the line
+    that makes the device belong to the account) and return the pairing
+    status snapshot.
+
+    Called from two places: the confirm endpoint (reassign=True — an
+    explicit approval always takes ownership, so re-pairing a MAC moves it
+    between accounts) and the status poll (reassign=False — only adopts a
+    device nobody owns yet).
+
+    The status poll path is what actually claims most devices now: under
+    Just Works pairing there is no confirm click at all, so
+    bluetooth_manager.py sets needs_claim once a device auto-pairs
+    (whether that came through the agent or the PropertiesChanged
+    fallback — see its module docstring) and mark_claimed() below clears
+    it, so this only fires once per pairing event even though the
+    dashboard polls every second. The same poll path also covers the
+    older confirm-based flow, where the confirm response itself can be
+    lost to the pairing-time Wi-Fi/Bluetooth radio stall.
+    """
+    st = btmgr.status()
+    if st["state"] != PairingState.PAIRED or not st["last_paired"]:
+        return st
+    mac = st["last_paired"]
+    if reassign or db.get_bt_device_owner(mac.upper()) is None:
+        name = next((d["name"] for d in btmgr.list_paired_devices()
+                     if d["mac"].upper() == mac.upper()), "Paired computer")
+        db.add_bt_device(mac, name, current_user())
+        btmgr.mark_claimed()
+        log.info("Device %s claimed by %s", mac, current_user())
+    return st
+
+
 @app.post("/api/bt/pair/confirm")
 @login_required
 def bt_pair_confirm():
@@ -214,15 +280,7 @@ def bt_pair_confirm():
 
     # Give BlueZ a moment to finish the bond before we read back the MAC.
     socketio.sleep(1.0)
-    st = btmgr.status()
-
-    if approve and st["state"] == PairingState.PAIRED and st["last_paired"]:
-        mac = st["last_paired"]
-        name = next((d["name"] for d in btmgr.list_paired_devices()
-                     if d["mac"].upper() == mac.upper()), "Paired computer")
-        # This is the line that makes the device belong to the account.
-        db.add_bt_device(mac, name, current_user())
-        log.info("Device %s claimed by %s", mac, current_user())
+    st = _claim_last_paired(reassign=True) if approve else btmgr.status()
 
     return jsonify(ok=True, status=st)
 
@@ -237,23 +295,13 @@ def bt_pair_cancel():
 @app.get("/api/bt/status")
 @login_required
 def bt_status():
+    if btmgr.available:
+        # Claims a freshly auto-paired device under Just Works pairing
+        # (needs_claim, set by bluetooth_manager.py) and, for the older
+        # confirm-based flow, adopts an unowned device left behind by a
+        # confirm response lost to the pairing-time radio stall.
+        _claim_last_paired(reassign=False)
     pairing = btmgr.status()
-
-    # With auto-accept (Just Works) pairing, there's no separate "Confirm"
-    # click to claim the device for an account anymore — this poll is what
-    # notices a newly-completed pairing and claims it for whoever's logged
-    # in and watching the dashboard. needs_claim is a one-shot flag set by
-    # _auto_approve() and cleared here, so this only fires once per pairing
-    # event even though the dashboard polls every second.
-    if pairing["needs_claim"] and pairing["last_paired"]:
-        mac = pairing["last_paired"]
-        name = next((d["name"] for d in btmgr.list_paired_devices()
-                     if d["mac"].upper() == mac.upper()), "Paired computer")
-        db.add_bt_device(mac, name, current_user())
-        btmgr.mark_claimed()
-        pairing["needs_claim"] = False
-        log.info("Device %s claimed by %s", mac, current_user())
-
     paired = btmgr.list_paired_devices() if btmgr.available else []
     owners = {d["mac"].upper(): d["username"] for d in db.get_bt_devices()}
     for d in paired:
@@ -472,11 +520,49 @@ def admin_reset():
 
 
 # ── Socket.IO ───────────────────────────────────────────────────────────────
+# Presence gating: the dashboard holds a Socket.IO connection whenever a
+# logged-in tab is open, so "zero authenticated sockets" == "nobody is
+# using the system" — and the detection pipeline suspends (no tracking,
+# no gestures, no cursor) until someone comes back. The grace period
+# keeps a page refresh or the pairing flow's location.reload() from
+# bouncing the pipeline.
+VIEWER_GRACE_S = 10.0
+_viewers      = set()
+_viewer_lock  = threading.Lock()
+
+
+def _suspend_if_no_viewers():
+    socketio.sleep(VIEWER_GRACE_S)
+    with _viewer_lock:
+        if _viewers:
+            return
+    # Closing the last dashboard tab IS a sign-out, not a pause: forget the
+    # tracked user exactly like /logout does, and bump their epoch so the
+    # cookie still sitting in their browser is dead — reopening the site
+    # lands on the login page instead of silently resuming tracking.
+    user = gesture.active_user
+    if user is not None:
+        _signout_epoch[user] = _signout_epoch.get(user, 0) + 1
+        gesture.set_active_user(None)
+        log.info("Last dashboard tab closed — signed out '%s'", user)
+    gesture.set_suspended(True)
+
+
 @socketio.on("connect")
 def on_connect():
-    if "user" not in session:
-        return False   # reject unauthenticated socket connections
+    if not _session_valid():
+        return False   # reject unauthenticated / signed-out socket connections
+    with _viewer_lock:
+        _viewers.add(request.sid)
+    gesture.set_suspended(False)
     socketio.emit("telemetry", gesture.telemetry())
+
+
+@socketio.on("disconnect")
+def on_disconnect():
+    with _viewer_lock:
+        _viewers.discard(request.sid)
+    socketio.start_background_task(_suspend_if_no_viewers)
 
 
 # ── Boot ────────────────────────────────────────────────────────────────────
@@ -489,7 +575,13 @@ def _boot_bluetooth():
     try:
         btmgr.start()
         hid.register_profile()
-        hid.start()
+        # The reconnect provider makes the Pi dial already-paired hosts on
+        # startup (we advertise HIDReconnectInitiate, so hosts wait for us)
+        # — without it, cursor control only worked right after a fresh
+        # pairing and a restart needed a forget + re-pair.
+        hid.start(reconnect_targets=lambda: [
+            d["mac"] for d in btmgr.list_paired_devices()
+        ] if btmgr.available else [])
         log.info("Bluetooth HID ready — pair a computer from the dashboard.")
     except Exception as e:
         log.error("Bluetooth unavailable: %s", e)
@@ -500,6 +592,9 @@ def _boot_bluetooth():
 if __name__ == "__main__":
     _boot_bluetooth()
     gesture.start()
+    # Boot idle: the camera/models build now (so first login is instant),
+    # but nothing tracks until a logged-in dashboard actually connects.
+    gesture.set_suspended(True)
     try:
         socketio.run(app, host="0.0.0.0", port=8080,
                      allow_unsafe_werkzeug=True)

@@ -18,8 +18,14 @@ HOW IT WORKS
   - Listens on two L2CAP sockets: PSM 17 (0x11) = control channel,
     PSM 19 (0x13) = interrupt channel. Input reports go out over the
     interrupt channel.
+  - ALSO dials out: the SDP record advertises HIDReconnectInitiate, so
+    paired hosts expect the Pi to initiate reconnection. A background
+    loop connects to known paired hosts whenever the channels are down
+    (hosts only ever connect to us on their own right after pairing).
   - Sends ABSOLUTE-position pointer reports (a digitizer-style
     descriptor), not relative deltas.
+  - Also exposes a minimal keyboard (its own report ID) so gestures can
+    send modifier+wheel chords — Ctrl+scroll is what hosts bind to zoom.
 
 WHY ABSOLUTE, NOT RELATIVE
   The whole control-zone design in this project maps a fixed camera
@@ -74,17 +80,33 @@ BTN_LEFT   = 0x01
 BTN_RIGHT  = 0x02
 BTN_MIDDLE = 0x04
 
-REPORT_ID = 0x02
+REPORT_ID     = 0x02   # pointer reports
+KBD_REPORT_ID = 0x01   # keyboard reports (conventional combo layout: kbd=1, mouse=2)
 # HID transport header byte for the interrupt channel: 0xA1 = (DATA << 4) | INPUT
 HID_INPUT_HEADER = 0xA1
 
-# ── HID report descriptor: absolute pointer + 3 buttons + relative wheel ─────
-# Report layout (7 bytes after the transport header):
+# Keyboard modifier bits (byte 0 of the keyboard report)
+MOD_LCTRL = 0x01
+
+# ── HID report descriptor: composite pointer + keyboard ─────────────────────
+# Two top-level collections, distinguished by report ID:
+#
+# Pointer report (ID 0x02, 7 bytes after the transport header):
 #   [0] report id (0x02)
 #   [1] buttons bitmask
 #   [2:4] X, uint16 little-endian, 0..ABS_MAX  (ABSOLUTE)
 #   [4:6] Y, uint16 little-endian, 0..ABS_MAX  (ABSOLUTE)
 #   [6] wheel, int8 (RELATIVE — wheels are inherently relative)
+#
+# Keyboard report (ID 0x01, 8 bytes after the transport header):
+#   [0] report id (0x01)
+#   [1] modifier bitmask (LCtrl=0x01, LShift=0x02, ... RGui=0x80)
+#   [2] reserved (always 0)
+#   [3:9] up to 6 concurrently-held key usage codes
+#
+# The keyboard exists so gestures can send modifier+wheel chords —
+# Ctrl+scroll is what actually zooms on host apps; a bare wheel only
+# scrolls (see BTCursorController.handle_action).
 HID_REPORT_DESCRIPTOR = bytes([
     0x05, 0x01,        # Usage Page (Generic Desktop)
     0x09, 0x02,        # Usage (Mouse)
@@ -123,6 +145,35 @@ HID_REPORT_DESCRIPTOR = bytes([
 
     0xC0,              #   End Collection
     0xC0,              # End Collection
+
+    0x05, 0x01,          # Usage Page (Generic Desktop)
+    0x09, 0x06,          # Usage (Keyboard)
+    0xA1, 0x01,          # Collection (Application)
+    0x85, KBD_REPORT_ID, #   Report ID (1)
+
+    0x05, 0x07,          #   Usage Page (Keyboard/Keypad)
+    0x19, 0xE0,          #   Usage Minimum (Left Control)
+    0x29, 0xE7,          #   Usage Maximum (Right GUI)
+    0x15, 0x00,          #   Logical Minimum (0)
+    0x25, 0x01,          #   Logical Maximum (1)
+    0x75, 0x01,          #   Report Size (1)
+    0x95, 0x08,          #   Report Count (8)
+    0x81, 0x02,          #   Input (Data, Variable, Absolute) — modifier bits
+
+    0x75, 0x08,          #   Report Size (8)
+    0x95, 0x01,          #   Report Count (1)
+    0x81, 0x03,          #   Input (Constant) — reserved byte
+
+    0x05, 0x07,          #   Usage Page (Keyboard/Keypad)
+    0x19, 0x00,          #   Usage Minimum (0)
+    0x29, 0x65,          #   Usage Maximum (101)
+    0x15, 0x00,          #   Logical Minimum (0)
+    0x25, 0x65,          #   Logical Maximum (101)
+    0x75, 0x08,          #   Report Size (8)
+    0x95, 0x06,          #   Report Count (6)
+    0x81, 0x00,          #   Input (Data, Array) — 6 key slots
+
+    0xC0,                # End Collection
 ])
 
 
@@ -188,7 +239,7 @@ def _sdp_record_xml():
   </attribute>
   <attribute id="0x0200"><uint16 value="0x0100" /></attribute>
   <attribute id="0x0201"><uint16 value="0x0111" /></attribute>
-  <attribute id="0x0202"><uint8 value="0x40" /></attribute>
+  <attribute id="0x0202"><uint8 value="0xc0" /></attribute>  <!-- subclass: keyboard + pointing combo -->
   <attribute id="0x0203"><uint8 value="0x00" /></attribute>
   <attribute id="0x0204"><boolean value="false" /></attribute>
   <attribute id="0x0205"><boolean value="true" /></attribute>
@@ -229,6 +280,9 @@ class BluetoothHIDDevice:
         hid.stop()
     """
 
+    # How often to retry dialing paired hosts while disconnected.
+    RECONNECT_INTERVAL_S = 8.0
+
     def __init__(self):
         self._ctrl_sock = None
         self._intr_sock = None
@@ -238,6 +292,7 @@ class BluetoothHIDDevice:
 
         self._running = False
         self._accept_thread = None
+        self._reconnect_targets = None
         self._lock = threading.Lock()
 
         # Cached pointer state — every report must carry the full state,
@@ -298,15 +353,29 @@ class BluetoothHIDDevice:
             manager.RegisterProfile(dbus.ObjectPath(PROFILE_DBUS_PATH), HID_UUID, opts)
             log.info("HID profile registered with BlueZ")
         except dbus.exceptions.DBusException as e:
-            # Already-registered is benign on a restart; anything else isn't.
             if "AlreadyExists" in str(e):
-                log.info("HID profile already registered — continuing")
+                # A previous run's registration is still live in this
+                # bluetoothd session. Its ServiceRecord may carry an OLD
+                # report descriptor, so re-register rather than keep it —
+                # otherwise descriptor changes silently never reach hosts.
+                log.info("HID profile already registered — re-registering "
+                         "so the current report descriptor is the one served")
+                manager.UnregisterProfile(dbus.ObjectPath(PROFILE_DBUS_PATH))
+                manager.RegisterProfile(dbus.ObjectPath(PROFILE_DBUS_PATH), HID_UUID, opts)
             else:
                 raise
 
     # ── Socket lifecycle ────────────────────────────────────────────────────
-    def start(self):
-        """Bind both L2CAP PSMs and begin accepting a host connection."""
+    def start(self, reconnect_targets=None):
+        """
+        Bind both L2CAP PSMs and begin accepting a host connection.
+
+        reconnect_targets: optional zero-arg callable returning the MACs of
+        already-paired hosts. When given, a background loop actively dials
+        them whenever the HID channels are down — see _reconnect_loop for
+        why the Pi (not the host) must initiate that connection.
+        """
+        self._reconnect_targets = reconnect_targets
         self._ctrl_sock = socket.socket(
             socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET, socket.BTPROTO_L2CAP)
         self._intr_sock = socket.socket(
@@ -329,6 +398,8 @@ class BluetoothHIDDevice:
         self._running = True
         self._accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
         self._accept_thread.start()
+        if self._reconnect_targets is not None:
+            threading.Thread(target=self._reconnect_loop, daemon=True).start()
         log.info("HID L2CAP sockets listening on PSM %d/%d", PSM_CONTROL, PSM_INTERRUPT)
 
     def _accept_loop(self):
@@ -353,6 +424,76 @@ class BluetoothHIDDevice:
                 self._peer_addr = ctrl_info[0]
             log.info("HID host connected: %s", self._peer_addr)
 
+    def _reconnect_loop(self):
+        """
+        Actively re-open the HID channels to an already-paired host.
+
+        Our SDP record declares HIDReconnectInitiate=true (attribute
+        0x0205), which tells hosts that the DEVICE initiates reconnection
+        — so after a Pi reboot or server restart, the paired PC just sits
+        waiting for us to dial. The accept loop alone only ever produced a
+        connection right after fresh pairing (the one time hosts connect
+        on their own), which is why cursor control used to require a
+        forget + re-pair on every restart. This loop is what real BT mice
+        do: while disconnected, periodically dial each paired host until
+        one answers.
+        """
+        import time
+        while self._running:
+            if not self.connected:
+                try:
+                    targets = list(self._reconnect_targets() or [])
+                except Exception:
+                    log.exception("reconnect target lookup failed")
+                    targets = []
+                for mac in targets:
+                    if not self._running or self.connected:
+                        break
+                    if self._connect_to_host(mac):
+                        break
+            time.sleep(self.RECONNECT_INTERVAL_S)
+
+    def _connect_to_host(self, mac):
+        """Dial one host: control channel first, then interrupt, per the
+        HID profile spec. Returns True on a fully-open channel pair."""
+        ctrl = intr = None
+        try:
+            ctrl = socket.socket(
+                socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET, socket.BTPROTO_L2CAP)
+            ctrl.settimeout(5.0)
+            ctrl.connect((mac, PSM_CONTROL))
+            intr = socket.socket(
+                socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET, socket.BTPROTO_L2CAP)
+            intr.settimeout(5.0)
+            intr.connect((mac, PSM_INTERRUPT))
+        except OSError:
+            # Host offline / out of range / BT off — normal, retry later.
+            for s in (ctrl, intr):
+                if s is not None:
+                    try:
+                        s.close()
+                    except OSError:
+                        pass
+            return False
+
+        ctrl.settimeout(None)
+        intr.settimeout(None)
+        with self._lock:
+            if self._intr_conn is not None:
+                # Host beat us to it via the accept loop while we were
+                # dialing — keep that connection, drop ours.
+                for s in (ctrl, intr):
+                    try:
+                        s.close()
+                    except OSError:
+                        pass
+                return False
+            self._ctrl_conn = ctrl
+            self._intr_conn = intr
+            self._peer_addr = mac
+        log.info("HID reconnected to paired host %s", mac)
+        return True
+
     @property
     def connected(self):
         with self._lock:
@@ -364,21 +505,12 @@ class BluetoothHIDDevice:
             return self._peer_addr
 
     # ── Report sending ──────────────────────────────────────────────────────
-    def _send(self):
-        """Push the current pointer state as one HID input report."""
+    def _send_report(self, report):
+        """Send one raw input report on the interrupt channel."""
         with self._lock:
             conn = self._intr_conn
             if conn is None:
                 return False
-            report = struct.pack(
-                "<BBBHHb",
-                HID_INPUT_HEADER,
-                REPORT_ID,
-                self._buttons,
-                self._x,
-                self._y,
-                0,          # wheel; set via scroll()
-            )
             try:
                 conn.send(report)
                 return True
@@ -390,6 +522,34 @@ class BluetoothHIDDevice:
                 self._ctrl_conn = None
                 self._peer_addr = None
                 return False
+
+    def _send(self):
+        """Push the current pointer state as one HID input report."""
+        with self._lock:
+            report = struct.pack(
+                "<BBBHHb",
+                HID_INPUT_HEADER,
+                REPORT_ID,
+                self._buttons,
+                self._x,
+                self._y,
+                0,          # wheel; set via scroll()
+            )
+        return self._send_report(report)
+
+    def _send_keyboard(self, modifiers, keys=()):
+        """Push one keyboard report: a modifier bitmask plus up to six
+        concurrently-held key usage codes (0-padded)."""
+        keys = tuple(keys)[:6]
+        keys += (0,) * (6 - len(keys))
+        report = struct.pack(
+            "<BBBB6B",
+            HID_INPUT_HEADER, KBD_REPORT_ID,
+            modifiers,
+            0,              # reserved byte, per the boot-keyboard layout
+            *keys,
+        )
+        return self._send_report(report)
 
     def move_absolute(self, nx, ny):
         """
@@ -427,23 +587,35 @@ class BluetoothHIDDevice:
     def scroll(self, clicks):
         """clicks: positive scrolls up, negative down. Wheel is relative."""
         with self._lock:
-            conn = self._intr_conn
-            if conn is None:
-                return False
             report = struct.pack(
                 "<BBBHHb",
                 HID_INPUT_HEADER, REPORT_ID, self._buttons,
                 self._x, self._y,
                 max(-127, min(127, int(clicks))),
             )
-            try:
-                conn.send(report)
-                return True
-            except OSError:
-                self._intr_conn = None
-                self._ctrl_conn = None
-                self._peer_addr = None
-                return False
+        return self._send_report(report)
+
+    def ctrl_scroll(self, clicks, latch_s=0.03):
+        """
+        Wheel movement with Ctrl held — the near-universal zoom chord
+        (browsers, PDFs, Office, image viewers all bind Ctrl+wheel to
+        zoom, while a bare wheel just scrolls).
+
+        The sleeps give the host time to latch the modifier before the
+        wheel event arrives and to process it before release — chording
+        across two report types back-to-back gets misordered by some
+        hosts otherwise. Ctrl is ALWAYS released, even if the wheel
+        report fails, so a dropped connection can't leave the host with
+        a stuck modifier when it reconnects.
+        """
+        import time
+        if not self._send_keyboard(MOD_LCTRL):
+            return False
+        time.sleep(latch_s)
+        ok = self.scroll(clicks)
+        time.sleep(latch_s)
+        self._send_keyboard(0)
+        return ok
 
     # ── Teardown ────────────────────────────────────────────────────────────
     def stop(self):

@@ -88,16 +88,15 @@ class PTZController:
     # The user's nose must drift outside this normalized distance from dead
     # center (0.5, 0.5) — independently on each axis — before the camera
     # reacts at all. Below this, the subject is considered "centered enough"
-    # and the motors don't move. Raised from the original 0.06 (which only
-    # tolerated the subject being within ~6% of the control zone before
-    # reacting — basically demanding pixel-perfect centering) to a wider,
-    # more forgiving band so normal fidgeting/shifting in place doesn't
-    # trigger constant tiny corrections.
+    # and the motors don't move.
     #
-    # NB: the servo steps are coarse — it can't land precisely on dead-center,
-    # so a tight tolerance just makes it hunt/dither around the middle. Keep
-    # this band wide enough to swallow one servo step's worth of movement.
-    CENTER_TOLERANCE     = 0.19154
+    # Tightened from 0.19154: that wide band existed to swallow the old
+    # SG90s' coarse, sloppy steps so they wouldn't hunt around the middle.
+    # The MG92B lands accurately on the commanded degree, the GPIO-driven
+    # SG92R takes sub-degree commands, and the gains ramp smoothly from the
+    # band edge — so a tighter band now just holds the face closer to dead
+    # center instead of dithering. Raise back toward 0.19 if it ever hunts.
+    CENTER_TOLERANCE     = 0.10
 
     # ── Tunables: position smoothing ─────────────────────────────────────────
     # EMA applied to the incoming nose position itself, BEFORE computing
@@ -109,31 +108,61 @@ class PTZController:
     POSITION_SMOOTH_ALPHA = 0.45
 
     # ── Tunables: pan/tilt (fine, face-driven) ──────────────────────────────
+    # Gains apply to the error BEYOND the center tolerance, so the response
+    # ramps smoothly from zero at the band edge instead of kicking in at
+    # full strength the instant the face crosses the tolerance. Magnitudes
+    # restored to the original 26/22 — the 6.5/6.0 crawl-tuning dated from
+    # when the servo connectors were miswired and made tracking visibly lag
+    # a moving subject once the wiring was fixed.
+    #
+    # Per-axis step ceilings replace the old shared MAX_STEP_PER_TICK, sized
+    # to what each servo can actually do: the metal-geared MG92B on pan is
+    # fast and accurate enough to execute 3°/tick (~60°/s at the 20 Hz tick
+    # rate) cleanly, and the SG92R on tilt is GPIO-driven and accepts
+    # fractional degrees, so its ceiling needn't be a whole number. Near the
+    # band edge both axes get genuinely sub-degree steps — pan banks them in
+    # a fractional accumulator until a whole degree is owed (Arducam-board
+    # limit), tilt commands the fraction directly.
     PAN_GAIN             = 26.0
     TILT_GAIN            = 22.0
-    MAX_STEP_PER_TICK    = 2    # lowered from 6 — smaller per-tick steps,
-                                  # smoother-looking motion at the same
-                                  # overall tracking speed (more, gentler
-                                  # ticks rather than fewer, larger jumps)
+    PAN_MAX_STEP         = 3.0    # °/tick ceiling — pan, MG92B via the board
+    TILT_MAX_STEP        = 2.5    # °/tick ceiling — tilt, SG92R via GPIO
 
     # ── Tunables: pose-fallback coarse search ───────────────────────────────
     POSE_PROXIMITY_THRESH = 0.22    # max normalized distance between pose
                                      # nose and the LAST KNOWN face position
                                      # to trust this pose as "probably them"
-    POSE_PAN_GAIN          = 24.0
-    POSE_TILT_GAIN         = 18.0
+    POSE_PAN_GAIN          = 24.0   # restored alongside PAN_GAIN/TILT_GAIN;
+    POSE_TILT_GAIN         = 18.0   # same beyond-the-deadzone application,
+                                     # kept slightly gentler than the face
+                                     # gains, as before
     POSE_VIS_THRESH        = 0.4    # match main.py's POSE_VIS_THRESH
 
     LOST_AFTER_SECONDS    = 1.0     # face AND pose both absent this long -> LOST
 
     UPDATE_MIN_INTERVAL   = 0.05
 
-    def __init__(self, active_user=None, i2c_bus=1, enabled=True, verbose=True):
+    def __init__(self, active_user=None, i2c_bus=1, enabled=True, verbose=True,
+                 tilt_gpio_pin=None):
         self.active_user = active_user
         self.enabled     = enabled
         self.verbose     = verbose
 
-        self._focuser = Focuser(i2c_bus)
+        if tilt_gpio_pin is not None:
+            # The Arducam board's tilt channel is dead (it ACKs OPT_MOTOR_Y
+            # writes but never drives the header) — route tilt pulses out a
+            # Pi GPIO pin instead. Pan/zoom/focus still go to the board.
+            from gpio_tilt import GpioTiltFocuser
+            self._focuser = GpioTiltFocuser(i2c_bus, tilt_pin=tilt_gpio_pin)
+            print(f"[PTZController] tilt servo driven from GPIO{tilt_gpio_pin} "
+                  f"(Arducam tilt channel bypassed)")
+        else:
+            self._focuser = Focuser(i2c_bus)
+
+        # GPIO-driven tilt (GpioTiltFocuser) accepts fractional degrees —
+        # the SG92R just follows whatever pulse width it's given. The
+        # Arducam board only takes whole degrees, hence the capability flag.
+        self._frac_tilt = bool(getattr(self._focuser, "FRACTIONAL_TILT", False))
 
         # Pan/tilt and focus are different registers but share ONE I2C bus and
         # busy flag. The autofocus controller drives OPT_FOCUS from its own
@@ -154,6 +183,13 @@ class PTZController:
         # the subject snaps straight to their real position instead of
         # slowly smoothing in from wherever the camera last pointed.
         self._smoothed_pos = None
+
+        # Fractional-degree carry for pan/tilt. The Arducam board only takes
+        # whole degrees, so per-tick steps below 1° accumulate here until
+        # they add up to a full degree — gentle proportional commands still
+        # move the camera instead of rounding to zero forever.
+        self._accum_x = 0.0
+        self._accum_y = 0.0
 
         # Commanded targets (NOT re-read from hardware every tick — see _Targets)
         self._targets = None  # populated from real hardware on first use
@@ -274,6 +310,10 @@ class PTZController:
                 pass
 
     def set_enabled(self, enabled: bool):
+        if enabled and not self.enabled:
+            # Resuming auto after manual driving — drop any stale sub-degree
+            # carry so the first correction is computed fresh.
+            self._accum_x = self._accum_y = 0.0
         self.enabled = enabled
 
     def set_active_user(self, username):
@@ -290,6 +330,7 @@ class PTZController:
         self.active_user          = username
         self._last_known_face_pos = None
         self._smoothed_pos        = None
+        self._accum_x = self._accum_y = 0.0
 
     def get_state(self) -> str:
         return self._state
@@ -334,6 +375,11 @@ class PTZController:
         except queue.Full:
             pass
         self._worker.join(timeout=2.0)
+        # GpioTiltFocuser needs its pulse train stopped; the plain I2C
+        # Focuser has no close() and needs none.
+        close_focuser = getattr(self._focuser, "close", None)
+        if callable(close_focuser):
+            close_focuser()
 
     # ── Background worker ─────────────────────────────────────────────────
     def _run(self):
@@ -380,6 +426,7 @@ class PTZController:
                                                  # the subject's real spot
                                                  # instead of smoothing in
                                                  # from a stale location
+                    self._accum_x = self._accum_y = 0.0  # and stale sub-degree carry
 
         with self._telemetry_lock:
             self._telemetry["state"] = self._state
@@ -461,53 +508,83 @@ class PTZController:
 
         try:
             if abs(err_x) > self.CENTER_TOLERANCE:
-                step = self._clamp(err_x * pan_gain,
-                                    -self.MAX_STEP_PER_TICK, self.MAX_STEP_PER_TICK)
-                # Subject moving right (err_x positive) must INCREASE
-                # motor_x to pan the camera right (confirmed against real
-                # hardware).
-                raw_new_val = self._targets.motor_x + int(round(step))
-                # Clamp our own commanded target to the real hardware
-                # range (0-180). Focuser.set() also clamps internally, but
-                # only the value IT writes — it never reports the clamped
-                # value back, so without this our internal target keeps
-                # drifting past the physical limit every tick while the
-                # real servo sits pinned at its end stop.
-                new_val = self._clamp(raw_new_val, mx_lo, mx_hi)
-                at_limit = (new_val != raw_new_val)
-                with self._io_lock:
-                    self._focuser.set(Focuser.OPT_MOTOR_X, new_val, 0)
-                pan_dir = "RIGHT" if step > 0 else "LEFT"
-                limit_note = "  *** AT PHYSICAL LIMIT ***" if at_limit else ""
-                self._log(f"PAN  err_x={err_x:+.3f} step={step:+.1f} "
-                          f"motor_x {self._targets.motor_x} -> {new_val}  ({pan_dir})  "
-                          f"[{self._state}]{limit_note}")
-                self._targets.motor_x = new_val
-                with self._telemetry_lock:
-                    self._telemetry["motor_x"] = new_val
-                    self._telemetry["last_pan_dir"] = pan_dir
-                    self._telemetry["last_action"] = "pan"
-                    self._telemetry["pan_at_limit"] = at_limit
+                # Gain acts on the error PAST the deadzone edge, so the step
+                # ramps up from zero as the face drifts further off-center
+                # instead of jumping to a full-strength command the moment
+                # the tolerance is crossed (see the PAN_GAIN comment).
+                excess = abs(err_x) - self.CENTER_TOLERANCE
+                step = self._clamp((excess if err_x > 0 else -excess) * pan_gain,
+                                    -self.PAN_MAX_STEP, self.PAN_MAX_STEP)
+                # Accumulate fractional degrees — the board only accepts
+                # whole ones. int() truncates toward zero, so the leftover
+                # fraction keeps its sign and carries into the next tick;
+                # a whole degree is only written once one has built up.
+                self._accum_x += step
+                whole = int(self._accum_x)
+                if whole != 0:
+                    self._accum_x -= whole
+                    # Subject moving right (err_x positive) must INCREASE
+                    # motor_x to pan the camera right (confirmed against real
+                    # hardware).
+                    raw_new_val = self._targets.motor_x + whole
+                    # Clamp our own commanded target to the real hardware
+                    # range (0-180). Focuser.set() also clamps internally, but
+                    # only the value IT writes — it never reports the clamped
+                    # value back, so without this our internal target keeps
+                    # drifting past the physical limit every tick while the
+                    # real servo sits pinned at its end stop.
+                    new_val = self._clamp(raw_new_val, mx_lo, mx_hi)
+                    at_limit = (new_val != raw_new_val)
+                    with self._io_lock:
+                        self._focuser.set(Focuser.OPT_MOTOR_X, new_val, 0)
+                    pan_dir = "RIGHT" if whole > 0 else "LEFT"
+                    limit_note = "  *** AT PHYSICAL LIMIT ***" if at_limit else ""
+                    self._log(f"PAN  err_x={err_x:+.3f} step={step:+.2f} "
+                              f"motor_x {self._targets.motor_x} -> {new_val}  ({pan_dir})  "
+                              f"[{self._state}]{limit_note}")
+                    self._targets.motor_x = new_val
+                    with self._telemetry_lock:
+                        self._telemetry["motor_x"] = new_val
+                        self._telemetry["last_pan_dir"] = pan_dir
+                        self._telemetry["last_action"] = "pan"
+                        self._telemetry["pan_at_limit"] = at_limit
 
             if abs(err_y) > self.CENTER_TOLERANCE:
-                step = self._clamp(err_y * tilt_gain,
-                                    -self.MAX_STEP_PER_TICK, self.MAX_STEP_PER_TICK)
-                raw_new_val = self._targets.motor_y + int(round(step))
-                new_val = self._clamp(raw_new_val, my_lo, my_hi)
-                at_limit = (new_val != raw_new_val)
-                with self._io_lock:
-                    self._focuser.set(Focuser.OPT_MOTOR_Y, new_val, 0)
-                tilt_dir = "DOWN" if step > 0 else "UP"
-                limit_note = "  *** AT PHYSICAL LIMIT ***" if at_limit else ""
-                self._log(f"TILT err_y={err_y:+.3f} step={step:+.1f} "
-                          f"motor_y {self._targets.motor_y} -> {new_val}  ({tilt_dir})  "
-                          f"[{self._state}]{limit_note}")
-                self._targets.motor_y = new_val
-                with self._telemetry_lock:
-                    self._telemetry["motor_y"] = new_val
-                    self._telemetry["last_tilt_dir"] = tilt_dir
-                    self._telemetry["last_action"] = "tilt"
-                    self._telemetry["tilt_at_limit"] = at_limit
+                # Same deadzone-relative proportional step as the pan axis.
+                excess = abs(err_y) - self.CENTER_TOLERANCE
+                step = self._clamp((excess if err_y > 0 else -excess) * tilt_gain,
+                                    -self.TILT_MAX_STEP, self.TILT_MAX_STEP)
+                if self._frac_tilt:
+                    # GPIO-driven SG92R: command the fractional step directly.
+                    # Rounded to 0.1° — about the real resolution of the
+                    # software-PWM pulse train, and it keeps a sub-resolution
+                    # step from producing a no-op write every tick.
+                    raw_new_val = round(self._targets.motor_y + step, 1)
+                else:
+                    # Arducam board only takes whole degrees — bank fractions
+                    # in the accumulator like the pan axis above.
+                    self._accum_y += step
+                    whole = int(self._accum_y)
+                    raw_new_val = None
+                    if whole != 0:
+                        self._accum_y -= whole
+                        raw_new_val = self._targets.motor_y + whole
+                if raw_new_val is not None and raw_new_val != self._targets.motor_y:
+                    new_val = self._clamp(raw_new_val, my_lo, my_hi)
+                    at_limit = (new_val != raw_new_val)
+                    with self._io_lock:
+                        self._focuser.set(Focuser.OPT_MOTOR_Y, new_val, 0)
+                    tilt_dir = "DOWN" if step > 0 else "UP"
+                    limit_note = "  *** AT PHYSICAL LIMIT ***" if at_limit else ""
+                    self._log(f"TILT err_y={err_y:+.3f} step={step:+.2f} "
+                              f"motor_y {self._targets.motor_y} -> {new_val}  ({tilt_dir})  "
+                              f"[{self._state}]{limit_note}")
+                    self._targets.motor_y = new_val
+                    with self._telemetry_lock:
+                        self._telemetry["motor_y"] = new_val
+                        self._telemetry["last_tilt_dir"] = tilt_dir
+                        self._telemetry["last_action"] = "tilt"
+                        self._telemetry["tilt_at_limit"] = at_limit
         except Exception as e:
             print(f"[PTZController] pan/tilt write failed: {e}")
 

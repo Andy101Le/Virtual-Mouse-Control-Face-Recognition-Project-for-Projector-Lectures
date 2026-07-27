@@ -35,11 +35,18 @@
     </p>
 
     <div class="dpad">
-      <button class="up"    data-tilt="2"  disabled aria-label="Tilt up">↑</button>
-      <button class="left"  data-pan="-2"  disabled aria-label="Pan left">←</button>
+      <button class="up"    data-tilt="1"  disabled aria-label="Tilt up">↑</button>
+      <button class="left"  data-pan="-1"  disabled aria-label="Pan left">←</button>
       <button class="home"  id="ptz-center" disabled aria-label="Center camera">center</button>
-      <button class="right" data-pan="2"   disabled aria-label="Pan right">→</button>
-      <button class="down"  data-tilt="-2" disabled aria-label="Tilt down">↓</button>
+      <button class="right" data-pan="1"   disabled aria-label="Pan right">→</button>
+      <button class="down"  data-tilt="-1" disabled aria-label="Tilt down">↓</button>
+    </div>
+
+    <div class="step-picker" role="group" aria-label="Nudge step size">
+      <span>Step</span>
+      <button data-step="1"  aria-pressed="true"  disabled>1°</button>
+      <button data-step="5"  aria-pressed="false" disabled>5°</button>
+      <button data-step="15" aria-pressed="false" disabled>15°</button>
     </div>
 
     <div class="slider-row">

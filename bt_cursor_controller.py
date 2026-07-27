@@ -96,15 +96,14 @@ class BTCursorController:
                 self._last_click_time[hand_id] = now
 
         elif confirmed == 'ZOOM IN':
-            # The pyautogui version sent ctrl+'+'. We can't send keystrokes
-            # from a pointer-only HID descriptor, so this maps to scroll
-            # wheel instead — which is the more universal "zoom" gesture and
-            # works in slides, PDFs, and browsers without a modifier key.
+            # Ctrl+wheel — the chord virtually every host app binds to
+            # zoom (a bare wheel would just scroll the page). Needs the
+            # composite pointer+keyboard HID descriptor in bluetooth_hid.
             if (now - self._last_scroll_time[hand_id]) > self.SCROLL_COOLDOWN:
-                self.hid.scroll(self.SCROLL_CLICKS)
+                self.hid.ctrl_scroll(self.SCROLL_CLICKS)
                 self._last_scroll_time[hand_id] = now
 
         elif confirmed == 'ZOOM OUT':
             if (now - self._last_scroll_time[hand_id]) > self.SCROLL_COOLDOWN:
-                self.hid.scroll(-self.SCROLL_CLICKS)
+                self.hid.ctrl_scroll(-self.SCROLL_CLICKS)
                 self._last_scroll_time[hand_id] = now

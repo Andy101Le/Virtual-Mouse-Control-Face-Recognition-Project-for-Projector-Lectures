@@ -71,6 +71,7 @@ class GestureSession:
 
         self.active_user = active_user
         self._running    = False
+        self._suspended  = False
         self._thread     = None
         self._lock       = threading.Lock()
 
@@ -112,6 +113,21 @@ class GestureSession:
             self.cam.release()
         if self.landmarks:
             self.landmarks.close()
+
+    def set_suspended(self, suspended):
+        """
+        True = idle the whole pipeline: frames are still read (so the
+        camera buffer stays fresh and resume is instant) but nothing is
+        processed — no detection, no face tracking, no PTZ following, no
+        HID cursor, no preview. Driven by the web server's viewer
+        presence: suspended once nobody with a logged-in dashboard tab is
+        connected, resumed the moment one connects.
+        """
+        if suspended == self._suspended:
+            return
+        self._suspended = suspended
+        log.info("Gesture pipeline %s",
+                 "SUSPENDED — no logged-in viewer" if suspended else "resumed")
 
     def set_active_user(self, username):
         """
@@ -247,6 +263,14 @@ class GestureSession:
                 time.sleep(0.01)
                 continue
 
+            if self._suspended:
+                # Nobody logged-in is watching — drop the frame unprocessed.
+                # Reading (above) still happens every pass so the sensor
+                # pipeline doesn't back up and resume shows a live image
+                # immediately, but no detection/tracking/cursor runs.
+                time.sleep(0.05)
+                continue
+
             frame_n += 1
             frame = cv2.flip(frame, 1)
 
@@ -314,6 +338,11 @@ class GestureSession:
                                     self.auth.face_nose_pos, w, h, zoom=self.zoom)
 
             hand_action_strs = []
+            # Both of the user's hands act independently (e.g. left clicks
+            # while right moves), but only ONE hand may drive the cursor per
+            # frame — first MOVE hand in detection order claims it, so two
+            # open palms don't yank the pointer back and forth.
+            move_claimed = False
             if h_result.hand_landmarks:
                 for hand_id, hand in enumerate(h_result.hand_landmarks):
                     wrist   = np.array([hand[0].x, hand[0].y], dtype=np.float32)
@@ -348,13 +377,22 @@ class GestureSession:
                     hand_action_strs.append((s, col))
 
                     tip_px = (int(sp[8, 0]), int(sp[8, 1]))
-                    if hand_is_user and hand_id == 0:
-                        self.cursor.handle_action(confirmed, hand_id, sxyz[8, :2])
+                    if hand_is_user:
                         if confirmed == 'MOVE':
-                            self.hud.draw_move_indicator(
-                                display, tip_px, self.auth.limb_mode,
-                                self.auth.face_nose_pos, w, h, zoom=self.zoom)
-                    elif not hand_is_user:
+                            if not move_claimed:
+                                move_claimed = True
+                                self.cursor.handle_action(confirmed, hand_id,
+                                                          sxyz[8, :2])
+                                self.hud.draw_move_indicator(
+                                    display, tip_px, self.auth.limb_mode,
+                                    self.auth.face_nose_pos, w, h, zoom=self.zoom)
+                        else:
+                            # Clicks/scrolls dispatch from ANY user hand —
+                            # per-hand cooldowns in the cursor controller
+                            # keep them from double-firing.
+                            self.cursor.handle_action(confirmed, hand_id,
+                                                      sxyz[8, :2])
+                    else:
                         self.hud.draw_blocked_hand(display, tip_px, zoom=self.zoom)
 
             detected = (set(range(len(h_result.hand_landmarks)))

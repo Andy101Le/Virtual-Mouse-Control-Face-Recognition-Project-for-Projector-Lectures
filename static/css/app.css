@@ -171,6 +171,31 @@ body { color: var(--ink); }
 .dpad .right { grid-area: 2 / 3; }
 .dpad .down  { grid-area: 3 / 2; }
 
+.step-picker {
+  display: flex; gap: 0.35rem; align-items: center; justify-content: center;
+  margin: -0.5rem 0 1rem;
+  font-size: 0.78rem; color: var(--ink-muted);
+}
+.step-picker button {
+  margin: 0; padding: 0.25rem 0.6rem;
+  font-family: var(--mono); font-size: 0.78rem;
+  background: var(--surface-2);
+  border: 1px solid var(--edge);
+  color: var(--ink-muted);
+  border-radius: 6px;
+}
+.step-picker button:hover:not(:disabled) {
+  border-color: var(--control);
+  color: var(--control);
+}
+.step-picker button[aria-pressed="true"] {
+  background: color-mix(in srgb, var(--control) 14%, transparent);
+  border-color: var(--control);
+  color: var(--control);
+  font-weight: 600;
+}
+.step-picker button:disabled { opacity: 0.35; cursor: not-allowed; }
+
 .slider-row { margin-bottom: 0.9rem; }
 .slider-row label {
   display: flex; justify-content: space-between; align-items: baseline;

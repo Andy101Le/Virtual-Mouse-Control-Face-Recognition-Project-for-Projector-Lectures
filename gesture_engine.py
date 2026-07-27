@@ -57,9 +57,14 @@ class _InferenceWorker:
     def _run(self):
         while True:
             data = self._q.get()
-            raw  = self._model(data, training=False).numpy()[0]
-            idx  = int(np.argmax(raw))
-            conf = float(raw[idx])
+            # data is a (2, 63) batch: the hand's features and their
+            # x-mirrored twin (see GestureEngine.classify). Keep whichever
+            # orientation the model is more confident about — the wrong
+            # chirality reads as an unfamiliar pose and scores low.
+            raw  = self._model(data, training=False).numpy()
+            row  = raw[int(np.argmax(np.max(raw, axis=1)))]
+            idx  = int(np.argmax(row))
+            conf = float(row[idx])
             act  = LABEL_MAP.get(idx, 'NO ACTION') if conf >= 0.75 else 'NO ACTION'
             with self._lock:
                 self._result = (act, conf)
@@ -97,7 +102,18 @@ class GestureEngine:
         pts_n  = smoothed_xyz - smoothed_xyz[0]
         scale  = np.max(np.abs(pts_n)) or 1.0
         pts_n /= scale
-        self._workers[hand_id].submit(pts_n.reshape(1, 63).astype(np.float32))
+        # The model was trained on right-hand samples only, so a left hand
+        # (an x-mirrored image of the training data) misclassifies. Rather
+        # than trust MediaPipe's handedness label (unreliable on partial
+        # views), submit the features AND their x-mirrored twin as one
+        # batch — the worker keeps the higher-confidence orientation, so
+        # either physical hand matches the training chirality. Mirroring
+        # after normalisation is safe: negating x changes neither the
+        # wrist-relative origin nor the max-abs scale.
+        mirrored = pts_n * np.float32([-1.0, 1.0, 1.0])
+        batch = np.stack([pts_n.reshape(63),
+                          mirrored.reshape(63)]).astype(np.float32)
+        self._workers[hand_id].submit(batch)
         action, confidence = self._workers[hand_id].result()
 
         gc = self._gesture_counters.setdefault(
