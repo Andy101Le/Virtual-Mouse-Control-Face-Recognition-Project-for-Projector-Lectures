@@ -243,26 +243,26 @@ def _claim_last_paired(reassign):
     that makes the device belong to the account) and return the pairing
     status snapshot.
 
-    Called from two places: the confirm endpoint (reassign=True — an
-    explicit approval always takes ownership, so re-pairing a MAC moves it
-    between accounts) and the status poll (reassign=False — only adopts a
-    device nobody owns yet).
-
-    The status poll path is what actually claims most devices now: under
-    Just Works pairing there is no confirm click at all, so
-    bluetooth_manager.py sets needs_claim once a device auto-pairs
-    (whether that came through the agent or the PropertiesChanged
-    fallback — see its module docstring) and mark_claimed() below clears
-    it, so this only fires once per pairing event even though the
-    dashboard polls every second. The same poll path also covers the
-    older confirm-based flow, where the confirm response itself can be
-    lost to the pairing-time Wi-Fi/Bluetooth radio stall.
+    Claims on any of three conditions:
+      - reassign=True: an explicit approval (the confirm endpoint) always
+        takes ownership, so re-confirming a MAC moves it between accounts.
+      - needs_claim: bluetooth_manager.py sets this once a device auto-pairs
+        under Just Works (whether that came through the agent or the
+        PropertiesChanged fallback — see its module docstring). There is no
+        confirm click in that flow, so this is what actually claims most
+        devices now. mark_claimed() below clears the flag on the same call
+        that consumes it, so it can't latch True forever and can't double-fire
+        even though the dashboard polls every second.
+      - the MAC has no owner yet: covers the older confirm-based flow, where
+        the confirm response itself can be lost to the pairing-time
+        Wi-Fi/Bluetooth radio stall, leaving a paired-but-unowned device for
+        the next status poll to adopt.
     """
     st = btmgr.status()
     if st["state"] != PairingState.PAIRED or not st["last_paired"]:
         return st
     mac = st["last_paired"]
-    if reassign or db.get_bt_device_owner(mac.upper()) is None:
+    if reassign or st["needs_claim"] or db.get_bt_device_owner(mac.upper()) is None:
         name = next((d["name"] for d in btmgr.list_paired_devices()
                      if d["mac"].upper() == mac.upper()), "Paired computer")
         db.add_bt_device(mac, name, current_user())

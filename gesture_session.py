@@ -234,13 +234,21 @@ class GestureSession:
         # report_frame below) and hunts directionally only when the image
         # goes soft. If there's no focus hardware / it errors, the loop keeps
         # running — autofocus is best-effort, never fatal.
-        try:
-            self.autofocus = AutoFocusController(self.ptz.focuser,
-                                                 self.ptz.io_lock)
-            self.autofocus.start()
-        except Exception:
-            log.exception("Autofocus unavailable — continuing without it")
-            self.autofocus = None
+        self.autofocus = None
+        if self.ptz.focuser is None:
+            # PTZController already warned on the command line and disabled
+            # itself (no I2C hardware) — there is no focus motor to drive
+            # either, so skip starting a worker thread that would just
+            # crash on its first hardware access.
+            log.info("No PTZ hardware — autofocus unavailable")
+        else:
+            try:
+                self.autofocus = AutoFocusController(self.ptz.focuser,
+                                                     self.ptz.io_lock)
+                self.autofocus.start()
+            except Exception:
+                log.exception("Autofocus unavailable — continuing without it")
+                self.autofocus = None
 
     def _run(self):
         try:

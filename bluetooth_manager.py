@@ -106,7 +106,7 @@ if _HAS_DBUS:
 
 
 class BluetoothManager:
-    def __init__(self, adapter_name="hci0", device_alias="Gesture Touchpad"):
+    def __init__(self, adapter_name="hci0", device_alias="Galaxy Mouse"):
         self.adapter_name = adapter_name
         self.device_alias = device_alias
 

@@ -229,7 +229,7 @@ async function pollPairing() {
       sawInProgress = true;
       $("pair-waiting-msg").innerHTML = "Always discoverable. Open " +
         "Bluetooth settings on your computer and connect to " +
-        "<b>Gesture Touchpad</b> any time.";
+        "<b>Galaxy Mouse</b> any time.";
       showPane("pair-waiting");
       startPolling();
     } else if (p.state === "confirming" && p.pending) {
@@ -240,7 +240,7 @@ async function pollPairing() {
     } else if (p.state === "pairable") {
       sawInProgress = true;
       $("pair-waiting-msg").innerHTML = "Open Bluetooth settings on your " +
-        "computer and connect to <b>Gesture Touchpad</b>.";
+        "computer and connect to <b>Galaxy Mouse</b>.";
       showPane("pair-waiting");
       startPolling();
     } else if (p.state === "paired") {
