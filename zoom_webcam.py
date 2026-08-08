@@ -109,6 +109,12 @@ class ZoomWebcamController:
         self._opt_headroom = 0.0
         self._opt_moving   = False
 
+        # Live control zone (x0, y0, x1, y1) normalized, or None to fall back
+        # to the fixed control_zone_margin box. The cursor's zone now tracks
+        # the user and scales with their apparent size, so the region that
+        # must stay visible is no longer a fixed inset — see set_control_zone.
+        self._live_zone = None
+
         # If given the cursor control zone's margin (CursorController.CAM_MARGIN),
         # cap zoom so the crop never excludes that zone — i.e. the person can
         # always see their own hand across its full reachable range.
@@ -144,6 +150,30 @@ class ZoomWebcamController:
     def toggle(self):
         self.enabled = not self.enabled
         return self.enabled
+
+    def set_control_zone(self, zone):
+        """
+        The cursor's live control zone, so the crop can be capped against the
+        region that actually has to stay visible.
+
+        This supersedes the FAR_MAX_ZOOM/far_factor heuristic below, which
+        existed only to approximate this: with a fixed zone, cropping tighter
+        than it would hide a distant presenter's reachable area, so the cap
+        had to be relaxed by guesswork as the subject receded. The real zone
+        already shrinks with distance, so the honest cap — "don't crop
+        tighter than the zone" — now works at every distance without
+        guessing. Pass None to fall back to the old fixed-margin behaviour.
+        """
+        self._live_zone = tuple(zone) if zone is not None else None
+
+    def _zone_cap(self):
+        """Largest zoom that still leaves the whole control zone on screen,
+        or None when there's no live zone to measure."""
+        if self._live_zone is None:
+            return None
+        x0, y0, x1, y1 = self._live_zone
+        zw, zh = max(x1 - x0, 1e-6), max(y1 - y0, 1e-6)
+        return max(1.0, min(1.0 / zw, 1.0 / zh))
 
     def set_optical(self, state):
         """
@@ -239,7 +269,12 @@ class ZoomWebcamController:
         fit_zoom_w      = w / region_w
 
         target_zoom = min(zoom_for_height, fit_zoom_h, fit_zoom_w, self.MAX_ZOOM)
-        if self.control_zone_zoom_cap is not None:
+        zone_cap = self._zone_cap()
+        if zone_cap is not None:
+            # A live zone measures the reachable area directly, so cap against
+            # it and skip the far_factor guesswork entirely.
+            target_zoom = min(target_zoom, zone_cap)
+        elif self.control_zone_zoom_cap is not None:
             # Distance-adaptive arm-reach cap. Up close (far_factor≈0) we hold
             # the strict control-zone cap so the user's outstretched arm stays
             # fully on screen for gesture control. As the subject recedes
@@ -305,15 +340,20 @@ class ZoomWebcamController:
         x1 = max(0, min(x1, w - crop_w))
         y1 = max(0, min(y1, h - crop_h))
 
-        if self.control_zone_margin is not None:
+        zone = self._live_zone
+        if zone is not None or self.control_zone_margin is not None:
             # The zoom-level cap already guarantees the crop is WIDE ENOUGH
             # to contain the control zone — this additionally constrains
             # WHERE it's centered, so panning toward an off-center subject
             # can't push the zone (partially) out of the visible crop. The
             # final re-clamp to frame bounds is just a safety net; given the
             # zoom cap, it shouldn't actually change anything.
-            cz_x1, cz_y1 = self.control_zone_margin * w, self.control_zone_margin * h
-            cz_x2, cz_y2 = w - cz_x1, h - cz_y1
+            if zone is not None:
+                cz_x1, cz_y1 = zone[0] * w, zone[1] * h
+                cz_x2, cz_y2 = zone[2] * w, zone[3] * h
+            else:
+                cz_x1, cz_y1 = self.control_zone_margin * w, self.control_zone_margin * h
+                cz_x2, cz_y2 = w - cz_x1, h - cz_y1
             cz_w,  cz_h  = cz_x2 - cz_x1, cz_y2 - cz_y1
             # Only pin the crop to contain the control zone while the crop is
             # actually wider/taller than the zone. Once the distance-adaptive

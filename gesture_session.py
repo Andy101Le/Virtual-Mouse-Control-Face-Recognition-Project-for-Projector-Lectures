@@ -114,6 +114,12 @@ ROI_RESEARCH_SECONDS     = 1.5
 # the crop keeps tightening as someone walks away and their face stops being
 # detectable at all — without it the last measured face size sticks forever
 # and the crop never engages in exactly the walk-away case it's built for.
+# How far past the control zone's half-width a hand may sit and still count
+# as the tracked user's. Slack above 1.0 because the zone is deliberately
+# sized for a COMFORTABLE extension, and a hand raised above the head or
+# stretched past it is still plainly theirs.
+HAND_OWNERSHIP_SLACK = 1.6
+
 POSE_HEAD_IDS         = (0, 2, 5, 7, 8)
 POSE_FACE_SIZE_RATIO  = 1.7
 POSE_HEAD_VIS_THRESH  = 0.35
@@ -147,6 +153,11 @@ class GestureSession:
         self._roi_last_seen = 0.0
         self._roi_recognised_t = 0.0  # last time the ACTIVE user was recognised
         self._roi_search_until = 0.0  # stay full-frame until this time
+
+        # Last good body scale for the cursor control zone, held across the
+        # frames where face detection drops out.
+        self._zone_anchor = None
+        self._zone_size   = None
 
         # Components are built lazily on start() so the web server can
         # boot (and show a useful error page) even if a model file is
@@ -651,6 +662,39 @@ class GestureSession:
             self.zoom.set_optical(self.ptz.get_zoom_state() if self.ptz else None)
             self.zoom.update(tracked_pose, pw, ph)
 
+            # Size the cursor control zone to the user's apparent reach. A
+            # fixed zone asked for the same absolute hand sweep at every
+            # distance, so a fully extended arm at range only ever reached
+            # the middle of the host screen.
+            # Face detection flickers at range, and face_size is None on any
+            # frame where nothing was found. Reverting to the fallback zone on
+            # each of those would drag the mapping — and the cursor with it —
+            # every time a distant face dropped for a beat. So hold the last
+            # good measurement for as long as the user counts as active;
+            # AuthManager's grace period already decides when they're really
+            # gone, and this reuses that judgement rather than inventing one.
+            if self.auth.face_nose_pos is not None and self.auth.face_size:
+                self._zone_anchor = self.auth.face_nose_pos
+                self._zone_size   = self.auth.face_size
+            if self.auth.user_active and self._zone_anchor is not None:
+                # Hand the detection bounds over too: the crop follows the
+                # face, so without this the zone can extend below what
+                # MediaPipe is looking at and the bottom of the host screen
+                # maps to hand positions that are never detected.
+                if win is not None:
+                    dx0, dy0, dcw, dch = win
+                    det_bounds = (dx0 / w, dy0 / h,
+                                  (dx0 + dcw) / w, (dy0 + dch) / h)
+                else:
+                    det_bounds = None
+                self.cursor.set_control_zone(self._zone_anchor, self._zone_size,
+                                             detect_window=det_bounds)
+            else:
+                self._zone_anchor = self._zone_size = None
+                self.cursor.set_control_zone(None, None)
+            # Keep the display crop honest about what has to stay visible.
+            self.zoom.set_control_zone(self.cursor.zone)
+
             # Crop FIRST on the clean frame, then draw HUD zoom-aware on top
             display = self.zoom.apply(preview)
 
@@ -663,7 +707,7 @@ class GestureSession:
                                          self.auth.recog_score,
                                          self.auth.face_size, pw, ph, zoom=self.zoom)
             self.hud.draw_control_zone(display, self.auth.limb_mode,
-                                       BTCursorController.CAM_MARGIN,
+                                       self.cursor.zone,
                                        pw, ph, zoom=self.zoom)
             self.hud.draw_crosshair(display, self.auth.limb_mode,
                                     self.auth.face_nose_pos, pw, ph, zoom=self.zoom)
@@ -682,10 +726,18 @@ class GestureSession:
                     sxyz = self.gestures.smooth_hand(hand_id, raw_pts)
                     sp   = (sxyz[:, :2] * (pw, ph)).astype(np.int32)
 
+                    # "Is this hand the tracked user's?" scales with how big
+                    # they appear, for the same reason the control zone does.
+                    # A fixed 0.70 normalized radius was most of the room at
+                    # 20 ft — wide enough to adopt a bystander's hand — while
+                    # being comparatively tight up close. Reach plus a margin
+                    # is the honest bound: a hand further from you than your
+                    # own arm can stretch is not yours.
+                    own_radius = self.cursor.reach_radius * HAND_OWNERSHIP_SLACK
                     hand_is_user = (self.auth.user_active and
                                     self.auth.face_nose_pos is not None and
                                     float(np.linalg.norm(
-                                        wrist - self.auth.face_nose_pos)) < 0.70)
+                                        wrist - self.auth.face_nose_pos)) < own_radius)
 
                     line_col = (255, 0, 0) if hand_is_user else (0, 0, 200)
                     dot_col  = (0, 255, 0) if hand_is_user else (0, 0, 200)

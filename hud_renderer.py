@@ -134,22 +134,24 @@ class HUDRenderer:
 
     # ── Control zone / crosshair ─────────────────────────────────────────
     @staticmethod
-    def draw_control_zone(frame, limb_mode, cam_margin, w, h, zoom=None):
+    def draw_control_zone(frame, limb_mode, zone, w, h, zoom=None):
         """
         Draws the exact rectangle CursorController.absolute_to_screen()
-        uses for its cam_margin/scale math — (cam_margin, cam_margin) to
-        (1-cam_margin, 1-cam_margin) in raw-frame space. Since this is
-        the SAME region driving the real cursor mapping (which always
-        operates on raw, un-cropped hand coordinates regardless of
-        display zoom), remapping these two corners through zoom keeps
-        the drawn box, the tracked face, and the actual reachable
-        cursor range in exact visual agreement at any zoom level: the
-        box always represents the same physical distance from the
-        face, and its corners always correspond to the screen's
-        corners.
+        maps across — pass the controller's live `zone` tuple
+        (x0, y0, x1, y1) in normalized raw-frame coords rather than a
+        margin, because the zone now tracks the user and scales with their
+        apparent size instead of being a fixed inset.
+
+        Since this is the SAME region driving the real cursor mapping
+        (which always operates on raw, un-cropped hand coordinates
+        regardless of display zoom), remapping these two corners through
+        zoom keeps the drawn box, the tracked face, and the actual
+        reachable cursor range in exact visual agreement at any zoom
+        level: the box's corners always correspond to the screen's corners.
         """
-        x1, y1 = cam_margin * w, cam_margin * h
-        x2, y2 = w - cam_margin * w, h - cam_margin * h
+        zx0, zy0, zx1, zy1 = zone
+        x1, y1 = zx0 * w, zy0 * h
+        x2, y2 = zx1 * w, zy1 * h
         if zoom is not None:
             x1, y1 = zoom.transform_point(x1, y1)
             x2, y2 = zoom.transform_point(x2, y2)

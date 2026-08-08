@@ -6,6 +6,7 @@ No camera, no I2C, no PTZ board — run them anywhere:
     python3 tests/test_zoom_handoff.py
     python3 tests/test_detector_telephoto.py
     python3 tests/test_face_recognition.py
+    python3 tests/test_control_zone.py
 
 They cover the logic that is easy to get silently wrong, not the hardware
 and not SFace's own accuracy (which needs real faces to measure).
@@ -31,6 +32,17 @@ distance-aware threshold ramp must stay monotonic and clamped. Two
 regressions here too: a registered bystander must not be able to make the
 active user return UNKNOWN, and `AuthManager` must pick the face that
 actually matches rather than whichever one MediaPipe returned first.
+
+**`test_control_zone.py`** — the reach-based cursor mapping. The zone used
+to be a fixed box at every distance, so reaching the screen edge meant
+sweeping your hand 85% of the way across the camera frame however far away
+you stood; at range a fully extended arm reached only the middle 22% of the
+screen. The test prints old-vs-new screen coverage per apparent face size
+and asserts full extension spans the whole screen at every distance. It
+also checks the zone is clamped by shifting rather than squashing (so
+sensitivity stays uniform left-to-right), that zone corners map exactly to
+screen corners, and that the hand-ownership radius tightens with distance
+instead of covering half the room.
 
 The face test copies `login_system.db` to a temp directory — it never
 writes to the real database.

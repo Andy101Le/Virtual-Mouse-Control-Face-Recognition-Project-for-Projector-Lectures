@@ -22,13 +22,21 @@ def unit(seed):
 
 
 print("== stale (pre-SFace) embeddings must be rejected, not misread ==")
+# Write a known legacy row rather than depending on whatever the live DB
+# happens to hold — users re-register over time, so asserting against the
+# real database's current contents would rot.
+legacy = np.zeros(1434, dtype=np.float32)      # old descriptor: 478 pts x 3
+conn = sqlite3.connect(fr.DATABASE_NAME)
+conn.execute("UPDATE users SET face_embedding=?, face_registered=1 "
+             "WHERE username='andy101le'", (legacy.tobytes(),))
+conn.commit(); conn.close()
+
 R = fr.FaceRecognizer(active_user="andy101le")
-print(f"  usable users : {list(R.face_db)}")
-print(f"  need re-enroll: {R.stale_users}")
-assert R.face_db == {}, "1434-float geometric rows must not load as SFace"
-assert set(R.stale_users) == {"admin", "andy101le", "Machu1287"}
+print(f"  1434-float row -> usable={list(R.face_db)} stale={R.stale_users}")
+assert "andy101le" not in R.face_db, "geometric row must not load as SFace"
+assert "andy101le" in R.stale_users
 assert R.needs_registration("andy101le")
-print("  all three legacy enrollments flagged for re-registration  OK")
+print("  legacy enrollment flagged for re-registration             OK")
 
 print()
 print("== DB round-trip: pack -> save -> load -> score ==")
