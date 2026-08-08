@@ -11,6 +11,7 @@ chat_logs/
 # Model + data binaries (too large / regenerable — keep out of git)
 /*.h5
 /*.task
+/*.onnx
 /*.csv
 /*.pki
 /*.db

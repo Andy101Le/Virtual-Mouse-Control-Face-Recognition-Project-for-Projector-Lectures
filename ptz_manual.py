@@ -117,7 +117,32 @@ class ManualPTZ:
     def set_hw_zoom(self, value):
         if not self.has_hw_zoom:
             return None
-        return self._write(Focuser.OPT_ZOOM, value, self.zoom_lo, self.zoom_hi)
+        # Same reason pan/tilt sync their targets: the tracker's optical
+        # auto-zoom reasons from _targets.zoom rather than re-reading the
+        # register, and _zoom_mag() scales the pan/tilt gains off it. Left
+        # stale, a manual zoom would make the tracker think the lens is
+        # still wide — it would step from the wrong position and drive
+        # pan/tilt with gains meant for a much wider field of view.
+        written = self._write(Focuser.OPT_ZOOM, value,
+                              self.zoom_lo, self.zoom_hi, "zoom")
+        if written is None:
+            return None
+        # A manual zoom shifts the focus plane exactly as an automatic one
+        # does, so it needs the same autofocus coordination the auto path
+        # gets — otherwise AF chases the blur across the slider drag. It also
+        # has to publish its own telemetry: the auto loop updates the
+        # telemetry dict as it steps, and with the tracker disabled during
+        # manual mode nothing else will, so the dashboard's optical-zoom
+        # readout would sit stale until auto mode resumed.
+        with self.ptz._telemetry_lock:
+            self.ptz._telemetry["zoom"] = written
+        cb = self.ptz.on_zoom_step
+        if cb:
+            try:
+                cb(written)
+            except Exception:
+                log.exception("on_zoom_step callback failed")
+        return written
 
     def center(self):
         self.set_pan((self.pan_lo + self.pan_hi) // 2)

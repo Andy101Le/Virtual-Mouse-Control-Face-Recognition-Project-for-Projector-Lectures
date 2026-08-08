@@ -27,6 +27,7 @@ Two things are different from main.py:
 
 import base64
 import logging
+import os
 import threading
 import time
 
@@ -43,6 +44,7 @@ from zoom_webcam import ZoomWebcamController
 from autofocus_controller import AutoFocusController
 from bt_cursor_controller import BTCursorController
 from face_recognizer import UNKNOWN_LABEL, FaceRecognizer
+from face_embedder import FaceEmbedder, AsyncFaceEmbedder
 
 log = logging.getLogger(__name__)
 
@@ -60,6 +62,64 @@ FACE_SAMPLE_DELAY   = 0.05
 
 PREVIEW_QUALITY = 70    # JPEG quality for the browser preview
 PREVIEW_FPS     = 15    # cap preview rate; detection still runs full speed
+
+# ── Long-range capture geometry ─────────────────────────────────────────────
+# Capture at 4x the old pixel count (same 4:3 aspect, so every normalized
+# coordinate, the control-zone margin, and the digital-zoom math behave
+# exactly as before), but never feed MediaPipe more than DETECT_W of width:
+# while someone is tracked, detection runs on a native-resolution crop
+# around them (a "detector telephoto" — ~2x the pixels on a distant face
+# for the same inference cost); with nobody tracked it runs on the full
+# frame downscaled to DETECT_W, which is identical to the old 640x480 path.
+#
+# The extra resolution is not free: the added preview downscale, detection
+# crop and larger autofocus ROI measure out at roughly 5-8 ms per frame on a
+# Pi 5, against a 33 ms budget at 30 fps. That buys ~2x the pixels on a
+# distant face, which is the whole point — but if the frame rate drops
+# further than you're willing to trade, set CAPTURE_HIRES=0 to fall straight
+# back to the old 640x480 single-resolution path (which also disables the
+# detection crop, since at 640 wide there are no spare pixels to crop into).
+# Watch the fps figure in the dashboard telemetry to decide.
+_HIRES = os.environ.get("CAPTURE_HIRES", "1") != "0"
+
+CAPTURE_W, CAPTURE_H = (1280, 960) if _HIRES else (640, 480)
+DETECT_W             = 640
+PREVIEW_W            = 640    # browser preview width — keeps JPEG/socket
+                              # load the same as the old full-frame preview
+
+# The crop shrinks as the face shrinks: full frame at/above
+# CROP_FULL_FACE_SIZE (close range — hands at the frame edges must stay
+# detectable), down to CROP_MIN_SCALE of the frame for a distant subject.
+CROP_FULL_FACE_SIZE = 0.20
+CROP_MIN_SCALE      = 0.50
+ROI_SMOOTH          = 0.35   # EMA on the crop centre so it glides, not jumps
+ROI_LOST_SECONDS    = 3.0    # nobody seen this long -> full-frame search
+
+# A crop is a blindfold: whatever falls outside it cannot be detected, so it
+# cannot correct the crop either. Two escapes from that trap:
+#
+#   - If the active user hasn't been RECOGNISED for this long while a crop is
+#     active, the crop is assumed to be pointed at the wrong person (a
+#     bystander's pose can hold the anchor indefinitely — their pose keeps
+#     "something seen" true, so ROI_LOST_SECONDS never fires). Drop to the
+#     full frame and re-search.
+#   - After such a reset, stay full-frame for a beat before cropping again,
+#     otherwise the next frame just re-locks onto the same bystander.
+ROI_UNRECOGNISED_SECONDS = 4.0
+ROI_RESEARCH_SECONDS     = 1.5
+
+# Pose head landmarks (MediaPipe pose: 0 nose, 2/5 eyes, 7/8 ears) and the
+# factor converting their span into the face-mesh bbox diagonal that
+# get_face_size() reports. Only the ratio's rough scale matters: it exists so
+# the crop keeps tightening as someone walks away and their face stops being
+# detectable at all — without it the last measured face size sticks forever
+# and the crop never engages in exactly the walk-away case it's built for.
+POSE_HEAD_IDS         = (0, 2, 5, 7, 8)
+POSE_FACE_SIZE_RATIO  = 1.7
+POSE_HEAD_VIS_THRESH  = 0.35
+# Fallback when even the head landmarks are too weak to measure: shrink the
+# estimate each face interval so the crop still tightens rather than freezing.
+ROI_FACE_SIZE_DECAY   = 0.90
 
 
 class GestureSession:
@@ -80,6 +140,14 @@ class GestureSession:
         self._capture_samples = []
         self._capture_last_t  = 0.0
 
+        # Tracked-crop ("detector telephoto") state — where in the full
+        # frame the person of interest is, and how big their face is.
+        self._roi_center    = None    # (x, y) normalized, or None
+        self._roi_face_size = None    # EMA of normalized face bbox diagonal
+        self._roi_last_seen = 0.0
+        self._roi_recognised_t = 0.0  # last time the ACTIVE user was recognised
+        self._roi_search_until = 0.0  # stay full-frame until this time
+
         # Components are built lazily on start() so the web server can
         # boot (and show a useful error page) even if a model file is
         # missing or the camera is busy.
@@ -91,6 +159,8 @@ class GestureSession:
         self.hud       = None
         self.zoom      = None
         self.autofocus = None
+        self.embedder  = None    # sync SFace, for enrollment
+        self.identifier = None   # async SFace worker, for live recognition
 
         self.last_error = None
         self.fps        = 0.0
@@ -109,6 +179,8 @@ class GestureSession:
             self._thread.join(timeout=5)
         if self.autofocus:
             self.autofocus.close()
+        if self.identifier:
+            self.identifier.close()
         if self.cam:
             self.cam.release()
         if self.landmarks:
@@ -163,11 +235,23 @@ class GestureSession:
             self.capture_request  = None
             self._capture_samples = []
 
-    def _handle_face_capture(self, cached_face_lms, now_t):
+    def _handle_face_capture(self, cached_face_lms, frame, now_t):
         """Harvest an embedding from this frame if registration is active."""
         with self._lock:
             username = self.capture_request
         if not username:
+            return
+
+        if self.embedder is None:
+            # Nothing usable can be stored without the recognition model, and
+            # writing a placeholder would mark the user "registered" while
+            # leaving them permanently unrecognisable.
+            self.socketio.emit("face_capture_error", {
+                "error": "Face recognition model missing — run "
+                         "setup/get_models.sh, then restart."})
+            with self._lock:
+                self.capture_request  = None
+                self._capture_samples = []
             return
 
         if not cached_face_lms:
@@ -182,7 +266,17 @@ class GestureSession:
             return
         self._capture_last_t = now_t
 
-        emb = FaceRecognizer.extract_embedding(cached_face_lms[0])
+        # Enrollment embeds inline rather than through the async worker: it
+        # runs a handful of times during a deliberate registration flow, and
+        # a sample must correspond to exactly the frame it was taken from.
+        emb = self.embedder.embed(frame, cached_face_lms[0])
+        if emb is None:
+            self.socketio.emit("face_capture_progress", {
+                "collected": len(self._capture_samples),
+                "needed":    FACE_SAMPLES_NEEDED,
+                "detected":  False,
+            })
+            return
         self._capture_samples.append(emb)
         n = len(self._capture_samples)
 
@@ -193,9 +287,19 @@ class GestureSession:
         })
 
         if n >= FACE_SAMPLES_NEEDED:
-            mean_emb  = np.mean(self._capture_samples, axis=0)
-            mean_emb /= (np.linalg.norm(mean_emb) or 1.0)   # L2 for cosine sim
-            self.db.save_face_embedding(username, mean_emb)
+            # Keep several diverse samples rather than one averaged point —
+            # a face varies with pose and expression, and max-similarity over
+            # a spread of samples tolerates that far better than distance to
+            # a mean that represents no actual view of the face.
+            samples = FaceRecognizer.pack_samples(self._capture_samples)
+            if samples is None:
+                self.socketio.emit("face_capture_error", {
+                    "error": "No usable face samples captured — try again."})
+                with self._lock:
+                    self.capture_request  = None
+                    self._capture_samples = []
+                return
+            self.db.save_face_embedding(username, samples)
 
             with self._lock:
                 self.capture_request  = None
@@ -209,6 +313,142 @@ class GestureSession:
 
             log.info("Face registered for '%s'", username)
             self.socketio.emit("face_capture_done", {"username": username})
+
+    # ── Zoom/autofocus coordination (PTZ worker-thread callbacks) ───────────
+    def _on_zoom_step(self, _zoom_value):
+        if self.autofocus is not None:
+            self.autofocus.suppress(1.2)
+
+    def _on_zoom_settled(self, _units_moved):
+        # trigger_refocus() deliberately bypasses the manual-focus guard,
+        # because its original caller was the user pressing "Focus now". Wired
+        # to an automatic hardware event that bypass becomes a bug: every zoom
+        # step would rack the lens away from the position the user parked with
+        # the slider, while the UI still reported MANUAL. Zoom moving is a
+        # reason to re-focus only if focus is ours to drive.
+        if self.autofocus is not None and self.autofocus.auto_enabled:
+            self.autofocus.trigger_refocus()
+
+    # ── Tracked-crop ("detector telephoto") helpers ─────────────────────────
+    def _update_roi(self, cached_pose_lms, now_t):
+        """
+        Keep the crop centre on the person of interest. Priority: the
+        recognised user's face, then any detected face, then the most
+        visible pose (bodies stay detectable far beyond faces — this is
+        what lets a distant user be ACQUIRED cold: pose aims the crop,
+        the crop makes their small face resolvable, recognition takes it
+        from there). This picks where detection LOOKS — it grants nothing:
+        identity still comes only from the recognition gate.
+        """
+        anchor = None
+        if self.auth.face_nose_pos is not None:
+            anchor = (float(self.auth.face_nose_pos[0]),
+                      float(self.auth.face_nose_pos[1]))
+            if self.auth.face_size:
+                self._blend_face_size(float(self.auth.face_size))
+            if self.auth.is_registered_face_visible:
+                # Only an actual recognition clears the bystander watchdog.
+                # "A face is present" is not evidence it's the right face.
+                self._roi_recognised_t = now_t
+        elif cached_pose_lms:
+            # Prefer the pose closest to where the anchor already is, rather
+            # than the most visible one. A bystander walking in front will
+            # usually out-score the tracked user on visibility, and picking
+            # by visibility hands them the crop; picking by continuity keeps
+            # it on the person we were already following.
+            best = None
+            for pose_lms in cached_pose_lms:
+                if not len(pose_lms) or pose_lms[0].visibility <= 0.4:
+                    continue
+                cand = (float(pose_lms[0].x), float(pose_lms[0].y))
+                if self._roi_center is None:
+                    key = -pose_lms[0].visibility     # cold start: most visible
+                else:
+                    key = ((cand[0] - self._roi_center[0]) ** 2 +
+                           (cand[1] - self._roi_center[1]) ** 2)
+                if best is None or key < best[0]:
+                    best, anchor = (key, cand), cand
+                    head = self._pose_face_size(pose_lms)
+            if anchor is not None:
+                # The face is no longer detectable but the body still is —
+                # size the crop from the head span so it keeps tightening as
+                # they recede. Without this the last good face size sticks
+                # and the crop never engages while someone walks away.
+                self._blend_face_size(head if head else
+                                      (self._roi_face_size or CROP_FULL_FACE_SIZE)
+                                      * ROI_FACE_SIZE_DECAY)
+
+        if anchor is not None:
+            if self._roi_center is None:
+                self._roi_center = anchor
+            else:
+                a = ROI_SMOOTH
+                self._roi_center = (a * anchor[0] + (1 - a) * self._roi_center[0],
+                                    a * anchor[1] + (1 - a) * self._roi_center[1])
+            self._roi_last_seen = now_t
+        elif (self._roi_center is not None and
+              (now_t - self._roi_last_seen) > ROI_LOST_SECONDS):
+            self._roi_center    = None   # back to full-frame searching
+            self._roi_face_size = None
+
+        # Bystander watchdog. A crop that has been up for a while without the
+        # active user being recognised inside it is, by definition, looking in
+        # the wrong place — and it can never discover that on its own, because
+        # the user is outside the only region being searched.
+        if (self._roi_center is not None and
+                (now_t - self._roi_recognised_t) > ROI_UNRECOGNISED_SECONDS):
+            self._roi_center      = None
+            self._roi_face_size   = None
+            self._roi_recognised_t = now_t          # restart the watchdog
+            self._roi_search_until = now_t + ROI_RESEARCH_SECONDS
+
+    def _blend_face_size(self, value):
+        """EMA the face-size estimate the crop is scaled from."""
+        self._roi_face_size = (value if self._roi_face_size is None else
+                               ROI_SMOOTH * value +
+                               (1 - ROI_SMOOTH) * self._roi_face_size)
+
+    @staticmethod
+    def _pose_face_size(pose_lms):
+        """Face size estimated from pose head landmarks, on the same scale
+        get_face_size() reports, or None if the head isn't visible enough."""
+        pts = [(lm.x, lm.y) for i in POSE_HEAD_IDS
+               for lm in (pose_lms[i],) if lm.visibility > POSE_HEAD_VIS_THRESH]
+        if len(pts) < 2:
+            return None
+        xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+        span = ((max(xs) - min(xs)) ** 2 + (max(ys) - min(ys)) ** 2) ** 0.5
+        return span * POSE_FACE_SIZE_RATIO if span > 1e-4 else None
+
+    def _detect_window(self, w, h, now_t=0.0):
+        """
+        The full-frame pixel rect detection should run on this frame:
+        (x0, y0, cw, ch), or None for the whole frame. Same aspect ratio
+        as the frame, so LandmarkPipeline's remap uses one uniform scale
+        and hand/face geometry is preserved exactly.
+        """
+        if now_t < self._roi_search_until:
+            # Forced full-frame re-search after the bystander watchdog fired.
+            return None
+        if self._roi_center is None or not _HIRES:
+            # At 640x480 capture the frame IS the detector's native input —
+            # cropping into it would hand MediaPipe fewer pixels, not more,
+            # so the telephoto trick only makes sense above DETECT_W.
+            return None
+        size  = self._roi_face_size
+        # No face size yet (pose-only anchor) means the face is too small
+        # to detect — use the tightest crop to give it the most pixels.
+        scale = (size / CROP_FULL_FACE_SIZE) if size else CROP_MIN_SCALE
+        scale = min(max(scale, CROP_MIN_SCALE), 1.0)
+        if scale >= 0.999:
+            return None
+        cw = int(round(w * scale))
+        ch = int(round(h * scale))
+        x0 = int(round(self._roi_center[0] * w - cw / 2))
+        y0 = int(round(self._roi_center[1] * h - ch / 2))
+        x0 = max(0, min(x0, w - cw))
+        y0 = max(0, min(y0, h - ch))
+        return (x0, y0, cw, ch)
 
     # ── Main loop ───────────────────────────────────────────────────────────
     def _build(self):
@@ -226,7 +466,29 @@ class GestureSession:
             face_detect_interval=FACE_DETECT_INTERVAL,
             pose_detect_interval=POSE_DETECT_INTERVAL,
         )
-        self.cam = CameraManager(width=640, height=480, fps=30)
+        self.cam = CameraManager(width=CAPTURE_W, height=CAPTURE_H, fps=30)
+
+        # Face identity. One embedding costs ~56 ms, so live recognition runs
+        # on a worker thread and the loop consumes whatever it last published;
+        # enrollment uses the synchronous one, where a sample must match the
+        # exact frame it came from. A missing model is not fatal, but it does
+        # mean nobody can be recognised — fail loudly and keep the pipeline
+        # up rather than authenticating people we cannot actually identify.
+        try:
+            self.embedder   = FaceEmbedder()
+            self.identifier = AsyncFaceEmbedder()
+            log.info("Face recognition (SFace) ready")
+        except FileNotFoundError as e:
+            self.embedder = self.identifier = None
+            log.error("%s — face recognition DISABLED; nobody will be "
+                      "recognised until the model is installed.", e)
+        except Exception:
+            self.embedder = self.identifier = None
+            log.exception("Face recognition unavailable — continuing without it")
+
+        if self.auth.face_rec.stale_users:
+            log.warning("Re-registration required for: %s",
+                        ", ".join(self.auth.face_rec.stale_users))
 
         # Continuous ("digital-camera style") autofocus, sharing the PTZ's
         # Focuser + I2C lock. start() kicks off the one-time full-range sweep
@@ -249,6 +511,13 @@ class GestureSession:
             except Exception:
                 log.exception("Autofocus unavailable — continuing without it")
                 self.autofocus = None
+
+        # Optical zoom <-> autofocus coordination: zoom moves shift the
+        # focus plane, so while the zoom motor steps, AF must not chase the
+        # transient blur (suppress), and once it settles it should re-find
+        # the peak deliberately (one forced hunt, which bypasses suppress).
+        self.ptz.on_zoom_step    = self._on_zoom_step
+        self.ptz.on_zoom_settled = self._on_zoom_settled
 
     def _run(self):
         try:
@@ -295,17 +564,53 @@ class GestureSession:
                 self.fps = 0.9 * self.fps + 0.1 / dt
 
             h, w  = frame.shape[:2]
-            rgb_c = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             ts_ms = int((now_t - start_time) * 1000)
+
+            # Choose what MediaPipe sees this frame: a native-resolution
+            # crop around the tracked person (transform maps its landmarks
+            # back to full-frame coordinates inside LandmarkPipeline), or
+            # the whole frame downscaled to DETECT_W when nobody's tracked.
+            win = self._detect_window(w, h, now_t)
+            if win is not None:
+                x0, y0, cw, ch = win
+                det       = frame[y0:y0 + ch, x0:x0 + cw]
+                transform = (x0 / w, y0 / h, cw / w)
+            else:
+                det       = frame
+                transform = None
+            if det.shape[1] > DETECT_W:
+                dh  = max(1, int(round(det.shape[0] * DETECT_W / det.shape[1])))
+                det = cv2.resize(det, (DETECT_W, dh),
+                                 interpolation=cv2.INTER_AREA)
+            rgb_c    = cv2.cvtColor(det, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_c)
 
             (h_result, cached_face_lms,
              cached_pose_lms, face_updated) = self.landmarks.detect(
-                mp_image, frame_n, ts_ms)
+                mp_image, frame_n, ts_ms, transform=transform)
 
             if face_updated:
-                self.auth.update(cached_face_lms, now_t)
-                self._handle_face_capture(cached_face_lms, now_t)
+                # Identity runs off-thread. Submit this frame's faces, then
+                # consume whatever the worker last finished — typically one
+                # or two face-intervals old, which the auth temperature
+                # debounce absorbs without noticing. Landmarks are already
+                # remapped to full-frame coords, so the FULL frame is the
+                # right image to align against, not the detection crop.
+                embeddings = None
+                if self.identifier is not None:
+                    self.identifier.submit(frame, cached_face_lms,
+                                           anchor=self._roi_center,
+                                           token=frame_n)
+                    published = self.identifier.result()
+                    embeddings = published[1] if published else None
+                self.auth.update(cached_face_lms, now_t, embeddings=embeddings)
+                self._handle_face_capture(cached_face_lms, frame, now_t)
+
+            # Follow the person with the detection crop, and point the
+            # autofocus sharpness window at them too.
+            self._update_roi(cached_pose_lms, now_t)
+            if self.autofocus is not None:
+                self.autofocus.set_roi_center(self._roi_center)
 
             # PTZ auto-tracking. In manual mode the controller is disabled
             # (see ptz_manual.ManualPTZ), so these calls become no-ops
@@ -315,6 +620,7 @@ class GestureSession:
                 recognised_user=self.auth.recognised_user,
                 is_registered_face_visible=self.auth.is_registered_face_visible,
                 pose_landmarks=cached_pose_lms,
+                face_size=self.auth.face_size,
             )
 
             # Pick the recognised user's pose for auto-zoom tracking
@@ -326,24 +632,41 @@ class GestureSession:
                     d = float(np.linalg.norm(p_nose - self.auth.face_nose_pos))
                     if d < 0.18 and (best is None or d < best):
                         best, tracked_pose = d, pose_lms
-            self.zoom.update(tracked_pose, w, h)
+            # Everything visual happens at preview resolution: the full-res
+            # frame exists for detection crops and autofocus only. The
+            # digital zoom + every HUD overlay work in normalized coords,
+            # so they land identically on the smaller canvas — and JPEG/
+            # socket cost stays what it was at 640x480 capture.
+            pw = min(PREVIEW_W, w)
+            ph = int(round(h * pw / w))
+            preview = (cv2.resize(frame, (pw, ph),
+                                  interpolation=cv2.INTER_AREA)
+                       if w > pw else frame)
+
+            # Optical zoom gets first refusal on any magnification, because
+            # it costs no image quality; the digital crop only adds what the
+            # lens has run out of travel to provide. Feeding the motor's
+            # state in here is what keeps the two loops from both chasing
+            # the same "person looks small" error at once.
+            self.zoom.set_optical(self.ptz.get_zoom_state() if self.ptz else None)
+            self.zoom.update(tracked_pose, pw, ph)
 
             # Crop FIRST on the clean frame, then draw HUD zoom-aware on top
-            display = self.zoom.apply(frame)
+            display = self.zoom.apply(preview)
 
             self.hud.draw_face_boxes(display, self.auth.face_rec, cached_face_lms,
                                      self.auth.recognised_user, UNKNOWN_LABEL,
-                                     w, h, zoom=self.zoom)
+                                     pw, ph, zoom=self.zoom)
             self.hud.draw_pose_skeletons(display, cached_pose_lms,
                                          self.auth.user_active,
                                          self.auth.face_nose_pos,
                                          self.auth.recog_score,
-                                         self.auth.face_size, w, h, zoom=self.zoom)
+                                         self.auth.face_size, pw, ph, zoom=self.zoom)
             self.hud.draw_control_zone(display, self.auth.limb_mode,
                                        BTCursorController.CAM_MARGIN,
-                                       w, h, zoom=self.zoom)
+                                       pw, ph, zoom=self.zoom)
             self.hud.draw_crosshair(display, self.auth.limb_mode,
-                                    self.auth.face_nose_pos, w, h, zoom=self.zoom)
+                                    self.auth.face_nose_pos, pw, ph, zoom=self.zoom)
 
             hand_action_strs = []
             # Both of the user's hands act independently (e.g. left clicks
@@ -357,7 +680,7 @@ class GestureSession:
                     raw_pts = np.array([[lm.x, lm.y, lm.z] for lm in hand],
                                        dtype=np.float32)
                     sxyz = self.gestures.smooth_hand(hand_id, raw_pts)
-                    sp   = (sxyz[:, :2] * (w, h)).astype(np.int32)
+                    sp   = (sxyz[:, :2] * (pw, ph)).astype(np.int32)
 
                     hand_is_user = (self.auth.user_active and
                                     self.auth.face_nose_pos is not None and
@@ -393,7 +716,7 @@ class GestureSession:
                                                           sxyz[8, :2])
                                 self.hud.draw_move_indicator(
                                     display, tip_px, self.auth.limb_mode,
-                                    self.auth.face_nose_pos, w, h, zoom=self.zoom)
+                                    self.auth.face_nose_pos, pw, ph, zoom=self.zoom)
                         else:
                             # Clicks/scrolls dispatch from ANY user hand —
                             # per-hand cooldowns in the cursor controller
@@ -408,11 +731,11 @@ class GestureSession:
             self.gestures.forget_stale_hands(detected)
 
             self.hud.draw_status_hud(display, self.fps, len(cached_pose_lms),
-                                     len(cached_face_lms), hand_action_strs, w)
+                                     len(cached_face_lms), hand_action_strs, pw)
             self.hud.draw_auth_banner(display, self.auth.auth_temp,
                                       self.auth.user_active,
                                       self.auth.grace_remaining(now_t),
-                                      AuthManager.TEMP_ACTIVATE, w, h)
+                                      AuthManager.TEMP_ACTIVATE, pw, ph)
             self.ptz.draw_debug_hud(display)
             display = self.zoom.draw_debug(display)
 
@@ -443,6 +766,12 @@ class GestureSession:
             "hid_connected":  self.hid.connected,
             "hid_peer":       self.hid.peer_address,
             "ptz_state":      self.ptz.get_state() if self.ptz else None,
+            "optical_zoom":   (self.ptz.get_telemetry().get("zoom")
+                               if self.ptz else None),
+            # What the viewer actually sees: optical x digital. Reporting
+            # only one of the two understates the framing whenever the
+            # handoff has the lens carrying most of the magnification.
+            "total_mag":      round(self.zoom.total_mag, 2) if self.zoom else 1.0,
             "focus":          self.autofocus.focus_position if self.autofocus else None,
             "focus_mode":     self.autofocus.mode if self.autofocus else None,
             "focus_state":    self.autofocus.state if self.autofocus else None,

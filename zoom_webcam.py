@@ -80,11 +80,34 @@ class ZoomWebcamController:
     SHOULDER_IDS = [11, 12]
     HIP_IDS      = [23, 24]
 
+    # ── Optical-zoom handoff ────────────────────────────────────────────────
+    # When the lens has a working zoom motor, magnification should come from
+    # it first: optical zoom is lossless, while every bit of digital zoom is
+    # just upscaled crop. So while the motor still has travel left toward
+    # telephoto, this class refuses to zoom IN any further and lets the motor
+    # do the work; it only takes over once the motor is at its stop — that's
+    # the "gap" it fills. Zooming OUT is never held back, because backing off
+    # a crop is instant and free while the motor takes seconds.
+    #
+    # No feedback loop is needed to keep the two in agreement: update() reads
+    # the person's size out of the frame the optical zoom already magnified,
+    # so as the motor racks in, region_h grows and the digital target falls
+    # out on its own.
+    OPTICAL_HEADROOM_EPS = 0.02   # treat below this as "motor is at its stop"
+
     def __init__(self, enabled=True, control_zone_margin=None):
         self.enabled = enabled
         self.zoom    = 1.0
         self.crop_cx = None
         self.crop_cy = None
+
+        # Latest optical zoom state, refreshed each frame by the vision loop
+        # via set_optical(). The default describes "no optical zoom at all",
+        # under which update() behaves exactly as it did before the motor
+        # existed.
+        self._opt_mag      = 1.0
+        self._opt_headroom = 0.0
+        self._opt_moving   = False
 
         # If given the cursor control zone's margin (CursorController.CAM_MARGIN),
         # cap zoom so the crop never excludes that zone — i.e. the person can
@@ -121,6 +144,25 @@ class ZoomWebcamController:
     def toggle(self):
         self.enabled = not self.enabled
         return self.enabled
+
+    def set_optical(self, state):
+        """
+        Feed in PTZController.get_zoom_state() (or None when there's no PTZ)
+        so update() knows how much magnification the lens is already
+        providing and whether the motor still has room to provide more.
+        """
+        if not state:
+            self._opt_mag, self._opt_headroom, self._opt_moving = 1.0, 0.0, False
+            return
+        self._opt_mag      = float(state.get("mag", 1.0))
+        self._opt_headroom = float(state.get("headroom", 0.0))
+        self._opt_moving   = bool(state.get("moving", False))
+
+    @property
+    def total_mag(self):
+        """Combined optical x digital magnification — what the viewer
+        actually sees, and the honest number to report in telemetry."""
+        return self._opt_mag * self.zoom
 
     @classmethod
     def _pts(cls, pose_landmarks, ids, w, h):
@@ -210,6 +252,21 @@ class ZoomWebcamController:
                 - self.control_zone_zoom_cap)
             target_zoom = min(target_zoom, eff_cap)
         target_zoom = max(target_zoom, 1.0)
+
+        # ── Defer to the optical zoom before cropping (see class comment) ──
+        if self._opt_moving:
+            # The motor is mid-travel and the frame is being magnified out
+            # from under us. Anything measured now is stale by the time the
+            # crop lands, so hold still rather than chase it.
+            target_zoom = self.zoom
+        elif (self._opt_headroom > self.OPTICAL_HEADROOM_EPS
+                and target_zoom > self.zoom):
+            # More magnification is wanted and the lens can still deliver it
+            # losslessly — don't spend crop on what the motor is about to do.
+            # Backing OUT stays unrestricted, which is why this only clamps
+            # the zoom-in direction.
+            target_zoom = self.zoom
+
         smooth = self.ZOOM_IN_SMOOTH if target_zoom > self.zoom else self.ZOOM_OUT_SMOOTH
         self.zoom += (target_zoom - self.zoom) * smooth
 
@@ -335,7 +392,16 @@ class ZoomWebcamController:
         frame apply() returned.
         """
         h, w = frame.shape[:2]
-        status = f"Zoom: {self.zoom:.2f}x" if self.enabled else "Zoom: OFF"
+        if not self.enabled:
+            status = "Zoom: OFF"
+        elif self._opt_mag > 1.001:
+            # Split the readout once the lens is contributing, so it's clear
+            # at a glance how much of the magnification is lossless and
+            # whether the handoff to digital has kicked in yet.
+            status = (f"Zoom: {self.total_mag:.2f}x "
+                      f"(opt {self._opt_mag:.2f} x dig {self.zoom:.2f})")
+        else:
+            status = f"Zoom: {self.zoom:.2f}x"
         cv2.putText(frame, status, (10, h - 60),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2, cv2.LINE_AA)
 

@@ -72,9 +72,10 @@ class _Targets:
     overshoot) commands. Reasoning from our own commanded targets
     avoids that class of bug entirely.
     """
-    def __init__(self, motor_x, motor_y):
+    def __init__(self, motor_x, motor_y, zoom):
         self.motor_x = motor_x
         self.motor_y = motor_y
+        self.zoom    = zoom
 
 
 # State machine states
@@ -138,15 +139,61 @@ class PTZController:
                                      # gains, as before
     POSE_VIS_THRESH        = 0.4    # match main.py's POSE_VIS_THRESH
 
-    LOST_AFTER_SECONDS    = 1.0     # face AND pose both absent this long -> LOST
+    # Lengthened from 1.0 s for long-range tracking: at distance the face
+    # detector flickers (small, marginal detections) and pose sometimes
+    # drops a beat too — a longer grace keeps the anchor alive through
+    # those gaps instead of resetting to LOST and zooming out.
+    LOST_AFTER_SECONDS    = 2.5     # face AND pose both absent this long -> LOST
 
     UPDATE_MIN_INTERVAL   = 0.05
 
+    # ── Tunables: optical auto-zoom (OPT_ZOOM) ──────────────────────────────
+    # The lens has a motorised zoom the project never used. While face-locked
+    # the controller servos it to hold the face's normalized size (bbox
+    # diagonal, as AuthManager.face_size reports it) inside a target band —
+    # subject walks away, face shrinks below the band, camera zooms in; and
+    # vice versa. On LOST it returns to the wide end so re-acquisition sees
+    # the whole room. This is the main range-doubling lever: 2x optical
+    # magnification puts 2x the pixels on the face at 2x the distance.
+    FACE_TARGET_LO   = 0.10   # zoom IN while face size below this
+    FACE_TARGET_HI   = 0.16   # zoom OUT while face size above this
+    FACE_SIZE_SMOOTH = 0.30   # EMA on face size fed to the zoom decision
+
+    ZOOM_STEP          = 500    # register units per zoom nudge while tracking
+    ZOOM_WIDE_STEP     = 1500   # faster steps when returning to wide on LOST
+    ZOOM_STEP_INTERVAL = 0.20   # min seconds between zoom writes — keeps the
+                                # shared I2C bus responsive for pan/tilt
+    ZOOM_DWELL_TICKS   = 4      # face must sit outside the band this many
+                                # consecutive snapshots before zoom moves
+                                # (rides out single noisy size readings)
+    ZOOM_SETTLE_S      = 0.6    # zoom idle this long after moving -> fire
+                                # on_zoom_settled (autofocus re-hunts then)
+
+    # True = register MAX_VALUE (20000) is the telephoto end. Flip this if
+    # test_zoom_sweep.py shows your lens is tightest at the LOW end.
+    ZOOM_TELE_AT_MAX = True
+
+    # Estimated optical magnification at full tele relative to full wide.
+    # Used to scale pan/tilt gains and step ceilings down as the FOV
+    # narrows — without this, gains tuned at wide angle overshoot and
+    # oscillate when zoomed in. Doesn't need to be exact; if tracking
+    # oscillates only when zoomed, raise it, and if zoomed tracking feels
+    # sluggish, lower it.
+    ZOOM_FOV_MAG = 3.0
+
     def __init__(self, active_user=None, i2c_bus=1, enabled=True, verbose=True,
-                 tilt_gpio_pin=None):
+                 tilt_gpio_pin=None, enable_zoom=True):
         self.active_user = active_user
         self.enabled     = enabled
         self.verbose     = verbose
+        self.zoom_enabled = enable_zoom
+
+        # Autofocus coordination hooks (set by GestureSession). Zoom moves
+        # shift the focus plane, so the AF controller must know when zoom is
+        # moving (suppress its scene-change hunts) and when it has settled
+        # (kick one deliberate re-hunt).
+        self.on_zoom_step    = None   # called as on_zoom_step(zoom_value)
+        self.on_zoom_settled = None   # called as on_zoom_settled(total_moved)
 
         try:
             if tilt_gpio_pin is not None:
@@ -205,6 +252,13 @@ class PTZController:
         self._accum_x = 0.0
         self._accum_y = 0.0
 
+        # Auto-zoom state
+        self._smoothed_face_size = None
+        self._zoom_dwell         = 0     # consecutive out-of-band snapshots
+        self._zoom_last_step_t   = 0.0
+        self._zoom_moved_accum   = 0     # units moved since last settle event
+        self._zoom_last_move_t   = 0.0
+
         # Commanded targets (NOT re-read from hardware every tick — see _Targets)
         self._targets = None  # populated from real hardware on first use
 
@@ -212,7 +266,7 @@ class PTZController:
         self._telemetry_lock = threading.Lock()
         self._telemetry = {
             "state": STATE_LOST,
-            "motor_x": None, "motor_y": None,
+            "motor_x": None, "motor_y": None, "zoom": None,
             "last_action": "idle",
             "last_pan_dir": "-", "last_tilt_dir": "-",
             "pan_at_limit": False, "tilt_at_limit": False,
@@ -239,18 +293,30 @@ class PTZController:
         register indefinitely until something starts fresh from a sane
         number.
         """
+        zoom_lo, zoom_hi = self._zoom_range()
+        # The WIDE end is whichever end isn't telephoto — not simply the low
+        # register value. With ZOOM_TELE_AT_MAX=False (which web_server tells
+        # you to set if your lens is tightest at the low end) parking at
+        # zoom_lo would mean parking at full TELE, making _zoom_mag() report
+        # 3x with the lens actually wide and inflating every derived figure.
+        zoom_wide = zoom_lo if self.ZOOM_TELE_AT_MAX else zoom_hi
         if self._focuser is None:
-            self._targets = _Targets(90, 90)  # no hardware — safe-ish placeholder
+            # No hardware — safe-ish placeholders, zoom at the wide end so
+            # _zoom_frac() reads 0.0 and _zoom_mag() stays 1.0, leaving the
+            # pan/tilt gains unscaled exactly as they were pre-zoom.
+            self._targets = _Targets(90, 90, zoom_wide)
             return
         try:
             with self._io_lock:
                 mx_raw = self._focuser.get(Focuser.OPT_MOTOR_X)
                 my_raw = self._focuser.get(Focuser.OPT_MOTOR_Y)
+                mz_raw = self._focuser.get(Focuser.OPT_ZOOM)
 
             mx = self._clamp(mx_raw, Focuser.opts[Focuser.OPT_MOTOR_X]["MIN_VALUE"],
                               Focuser.opts[Focuser.OPT_MOTOR_X]["MAX_VALUE"])
             my = self._clamp(my_raw, Focuser.opts[Focuser.OPT_MOTOR_Y]["MIN_VALUE"],
                               Focuser.opts[Focuser.OPT_MOTOR_Y]["MAX_VALUE"])
+            mz = self._clamp(mz_raw, zoom_lo, zoom_hi)
 
             if (mx, my) != (mx_raw, my_raw):
                 print(f"[PTZController] WARNING: hardware register(s) were out of "
@@ -261,13 +327,15 @@ class PTZController:
                     self._focuser.set(Focuser.OPT_MOTOR_X, mx, 0)
                     self._focuser.set(Focuser.OPT_MOTOR_Y, my, 0)
 
-            self._targets = _Targets(mx, my)
+            self._targets = _Targets(mx, my, mz)
             with self._telemetry_lock:
                 self._telemetry["motor_x"] = mx
                 self._telemetry["motor_y"] = my
+                self._telemetry["zoom"]    = mz
         except Exception as e:
             print(f"[PTZController] Could not read initial hardware state: {e}")
-            self._targets = _Targets(90, 90)  # safe-ish mid-range fallback
+            # Safe-ish fallbacks: mid-range pan/tilt, wide-end zoom.
+            self._targets = _Targets(90, 90, zoom_wide)
 
     # ── Public API ──────────────────────────────────────────────────────────
     @property
@@ -282,7 +350,7 @@ class PTZController:
         return self._io_lock
 
     def update(self, nose_pos, recognised_user, is_registered_face_visible,
-               pose_landmarks=None):
+               pose_landmarks=None, face_size=None):
         """
         Call once per main-loop iteration (cheap — just queues a snapshot
         for the background worker; never blocks).
@@ -296,6 +364,9 @@ class PTZController:
             Used as a coarse fallback when face detection can't resolve the
             user at a distance. Optional — omit it and the controller just
             won't have a pose fallback (face-only behavior).
+        face_size: normalized face bbox diagonal (AuthManager.face_size), or
+            None. Drives the optical auto-zoom: while face-locked, zoom
+            servos to keep this inside [FACE_TARGET_LO, FACE_TARGET_HI].
         """
         if not self.enabled:
             return
@@ -311,6 +382,7 @@ class PTZController:
             "is_target_visible": bool(is_registered_face_visible and
                                        recognised_user == self.active_user),
             "pose_landmarks": pose_landmarks or [],
+            "face_size": None if face_size is None else float(face_size),
             "t": now,
         }
 
@@ -348,6 +420,8 @@ class PTZController:
         self._last_known_face_pos = None
         self._smoothed_pos        = None
         self._accum_x = self._accum_y = 0.0
+        self._smoothed_face_size  = None
+        self._zoom_dwell          = 0
 
     def get_state(self) -> str:
         return self._state
@@ -419,6 +493,7 @@ class PTZController:
             self._last_known_face_pos = snap["nose_pos"]
             smoothed = self._smooth_position(snap["nose_pos"])
             self._track_pan_tilt_fine(smoothed)
+            self._auto_zoom_track(snap["face_size"], now)
 
         else:
             # Face not confirmed this frame — see if a pose plausibly
@@ -444,6 +519,13 @@ class PTZController:
                                                  # instead of smoothing in
                                                  # from a stale location
                     self._accum_x = self._accum_y = 0.0  # and stale sub-degree carry
+                    self._smoothed_face_size = None
+                if self._state == STATE_LOST:
+                    # Wide FOV finds a re-appearing subject far faster than a
+                    # zoomed-in one — return to the wide end while LOST.
+                    self._auto_zoom_wide(now)
+
+        self._auto_zoom_check_settled(now)
 
         with self._telemetry_lock:
             self._telemetry["state"] = self._state
@@ -499,15 +581,199 @@ class PTZController:
 
         return best
 
+    # ── Optical auto-zoom ───────────────────────────────────────────────────
+    def _zoom_range(self):
+        # ptz_manual._opt_bounds exists because trimmed copies of Focuser.py
+        # in the wild define only OPT_FOCUS. _seed_targets runs from
+        # __init__, which web_server executes at module scope, so an
+        # unguarded KeyError here would stop the whole server from importing
+        # rather than just costing us the zoom channel.
+        o = Focuser.opts.get(Focuser.OPT_ZOOM)
+        if not o:
+            return 3000, 20000    # documented Arducam range
+        return o["MIN_VALUE"], o["MAX_VALUE"]
+
+    def _zoom_frac(self):
+        """How far toward telephoto we are: 0.0 = full wide, 1.0 = full tele."""
+        lo, hi = self._zoom_range()
+        f = (self._targets.zoom - lo) / float(hi - lo)
+        return f if self.ZOOM_TELE_AT_MAX else 1.0 - f
+
+    def _zoom_mag(self):
+        """Estimated optical magnification at the current zoom position,
+        relative to full wide. Pan/tilt gains and step ceilings divide by
+        this: the same normalized on-screen error corresponds to a smaller
+        angular error once the FOV has narrowed, so unscaled gains overshoot
+        and oscillate exactly when zoomed onto a distant subject."""
+        return 1.0 + self._zoom_frac() * (self.ZOOM_FOV_MAG - 1.0)
+
+    def get_zoom_state(self):
+        """
+        What the digital zoom needs to know to stay out of the optical
+        zoom's way. Safe to call from the vision thread every frame — it
+        only reads commanded-target bookkeeping, never touches I2C.
+
+        mag:      current optical magnification relative to full wide.
+        headroom: 0..1, how much of the optical range is still unused
+                  toward telephoto. 0.0 means the motor is at its tele
+                  stop and any further magnification must come from the
+                  digital crop.
+        moving:   True while the motor is mid-travel. The digital zoom
+                  freezes then, so the picture doesn't pump as the two
+                  loops chase the same error at different speeds.
+
+        With optical zoom disabled or no hardware present this reports a
+        motor pinned at full wide with no headroom, which makes the
+        digital zoom behave exactly as it did before optical existed.
+        """
+        if self._targets is None:
+            return {"mag": 1.0, "headroom": 0.0, "moving": False}
+        if not (self.zoom_enabled and self.enabled):
+            # Nothing is going to drive the motor — auto-zoom is off, or the
+            # web UI took manual control (ManualPTZ.set_mode disables the
+            # whole controller). The lens can still be parked at telephoto,
+            # by the manual slider or by a previous run, so report the real
+            # magnification; but report NO headroom, or the digital zoom
+            # would sit forever waiting on a motor that will never step.
+            return {"mag": self._zoom_mag(), "headroom": 0.0, "moving": False}
+
+        # Headroom is about INTENT, not mechanical travel. The optical loop
+        # stops as soon as the face is inside [FACE_TARGET_LO, FACE_TARGET_HI]
+        # and will not move again however much travel remains — so reporting
+        # raw remaining travel would park the digital zoom at 1.0 forever and
+        # silently replace its framing target with the much looser optical
+        # one. Headroom is therefore nonzero only when the motor both wants
+        # to go further toward tele AND still can.
+        wants_tele = (self._smoothed_face_size is not None and
+                      self._smoothed_face_size < self.FACE_TARGET_LO)
+        travel_left = max(0.0, 1.0 - self._zoom_frac())
+        return {
+            "mag":      self._zoom_mag(),
+            "headroom": travel_left if wants_tele else 0.0,
+            # perf_counter, not time(): _zoom_last_move_t is stamped from
+            # the snapshot clock in update(), which is perf_counter-based.
+            "moving":   (time.perf_counter() - self._zoom_last_move_t)
+                        < self.ZOOM_SETTLE_S,
+        }
+
+    def _auto_zoom_track(self, face_size, now):
+        """Face-locked: hold the face's normalized size inside the target
+        band by nudging the zoom motor. Runs on the worker thread."""
+        if not self.zoom_enabled or face_size is None:
+            return
+
+        if self._smoothed_face_size is None:
+            self._smoothed_face_size = face_size
+        else:
+            a = self.FACE_SIZE_SMOOTH
+            self._smoothed_face_size = (a * face_size +
+                                        (1 - a) * self._smoothed_face_size)
+
+        fs = self._smoothed_face_size
+        if fs < self.FACE_TARGET_LO:
+            zoom_in = True
+        elif fs > self.FACE_TARGET_HI:
+            zoom_in = False
+        else:
+            self._zoom_dwell = 0
+            return
+
+        # Require the face to sit outside the band for several consecutive
+        # snapshots — one glitchy size reading must not pump the zoom motor.
+        self._zoom_dwell += 1
+        if self._zoom_dwell < self.ZOOM_DWELL_TICKS:
+            return
+
+        tele_sign = 1 if self.ZOOM_TELE_AT_MAX else -1
+        delta = self.ZOOM_STEP * tele_sign * (1 if zoom_in else -1)
+        self._zoom_write_delta(delta, now)
+
+    def _auto_zoom_wide(self, now):
+        """LOST: step back toward the wide end (chunked, not one long travel,
+        so the shared I2C bus never blocks for the whole journey)."""
+        if not self.zoom_enabled:
+            return
+        lo, hi = self._zoom_range()
+        wide = lo if self.ZOOM_TELE_AT_MAX else hi
+        delta = self._clamp(wide - self._targets.zoom,
+                            -self.ZOOM_WIDE_STEP, self.ZOOM_WIDE_STEP)
+        self._zoom_write_delta(delta, now)
+
+    def _zoom_write_delta(self, register_delta, now):
+        if register_delta == 0:
+            return
+        if now - self._zoom_last_step_t < self.ZOOM_STEP_INTERVAL:
+            return
+        lo, hi = self._zoom_range()
+        new = int(self._clamp(self._targets.zoom + register_delta, lo, hi))
+        if new == self._targets.zoom:
+            return
+        try:
+            with self._io_lock:
+                # flag=0 → don't block for motor travel on THIS call. Note
+                # this defers the wait rather than avoiding it: Focuser.set
+                # calls waitingForFree() before writing, so the next bus op
+                # pays for this travel — and since pan/tilt runs on this same
+                # worker thread and holds the same _io_lock, that cost lands
+                # on pan/tilt. During a zoom ramp the tracking rate therefore
+                # drops below UPDATE_MIN_INTERVAL and queued snapshots get
+                # dropped (queue maxsize=1). Degraded tracking while zooming
+                # is the accepted trade; the alternative is blocking here for
+                # the full travel, which is strictly worse.
+                self._focuser.set(Focuser.OPT_ZOOM, new, 0)
+        except Exception as e:
+            print(f"[PTZController] zoom write failed: {e}")
+            return
+
+        self._log(f"ZOOM {self._targets.zoom} -> {new}  "
+                  f"(face_size={self._smoothed_face_size and round(self._smoothed_face_size, 3)}, "
+                  f"mag~{self._zoom_mag():.2f}x)  [{self._state}]")
+        self._targets.zoom     = new
+        self._zoom_last_step_t = now
+        self._zoom_last_move_t = now
+        self._zoom_moved_accum += abs(register_delta)
+        self._zoom_dwell        = 0
+        with self._telemetry_lock:
+            self._telemetry["zoom"]        = new
+            self._telemetry["last_action"] = "zoom"
+
+        cb = self.on_zoom_step
+        if cb:
+            try:
+                cb(new)
+            except Exception:
+                pass
+
+    def _auto_zoom_check_settled(self, now):
+        """Fire on_zoom_settled once the motor has been quiet for a beat
+        after moving — that's when autofocus should do ONE deliberate
+        re-hunt, instead of chasing the focus plane during the ramp."""
+        if (self._zoom_moved_accum and
+                (now - self._zoom_last_move_t) >= self.ZOOM_SETTLE_S):
+            moved = self._zoom_moved_accum
+            self._zoom_moved_accum = 0
+            cb = self.on_zoom_settled
+            if cb:
+                try:
+                    cb(moved)
+                except Exception:
+                    pass
+
     # ── Pan / tilt — fine (face-driven) ─────────────────────────────────────
     def _track_pan_tilt_fine(self, nose_xy):
-        self._track_pan_tilt(nose_xy, self.PAN_GAIN, self.TILT_GAIN)
+        m = self._zoom_mag()
+        self._track_pan_tilt(nose_xy, self.PAN_GAIN / m, self.TILT_GAIN / m,
+                             self.PAN_MAX_STEP / m, self.TILT_MAX_STEP / m)
 
     # ── Pan / tilt — coarse (pose-driven, gentler gain) ─────────────────────
     def _track_pan_tilt_coarse(self, nose_xy):
-        self._track_pan_tilt(nose_xy, self.POSE_PAN_GAIN, self.POSE_TILT_GAIN)
+        m = self._zoom_mag()
+        self._track_pan_tilt(nose_xy, self.POSE_PAN_GAIN / m,
+                             self.POSE_TILT_GAIN / m,
+                             self.PAN_MAX_STEP / m, self.TILT_MAX_STEP / m)
 
-    def _track_pan_tilt(self, nose_xy, pan_gain, tilt_gain):
+    def _track_pan_tilt(self, nose_xy, pan_gain, tilt_gain,
+                        pan_max_step, tilt_max_step):
         nx, ny = nose_xy
         err_x = nx - 0.5   # positive => subject is right of center (in the
                             # mirrored preview main.py shows you)
@@ -531,7 +797,7 @@ class PTZController:
                 # the tolerance is crossed (see the PAN_GAIN comment).
                 excess = abs(err_x) - self.CENTER_TOLERANCE
                 step = self._clamp((excess if err_x > 0 else -excess) * pan_gain,
-                                    -self.PAN_MAX_STEP, self.PAN_MAX_STEP)
+                                    -pan_max_step, pan_max_step)
                 # Accumulate fractional degrees — the board only accepts
                 # whole ones. int() truncates toward zero, so the leftover
                 # fraction keeps its sign and carries into the next tick;
@@ -570,7 +836,7 @@ class PTZController:
                 # Same deadzone-relative proportional step as the pan axis.
                 excess = abs(err_y) - self.CENTER_TOLERANCE
                 step = self._clamp((excess if err_y > 0 else -excess) * tilt_gain,
-                                    -self.TILT_MAX_STEP, self.TILT_MAX_STEP)
+                                    -tilt_max_step, tilt_max_step)
                 if self._frac_tilt:
                     # GPIO-driven SG92R: command the fractional step directly.
                     # Rounded to 0.1° — about the real resolution of the

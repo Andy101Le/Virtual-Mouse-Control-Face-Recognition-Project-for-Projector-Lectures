@@ -70,6 +70,9 @@ class AutoFocusController:
     # Focuser.OPT_FOCUS accepts 0..20000; the Arducam reference autofocus
     # never racks past ~18000 (beyond that is mechanical over-travel with no
     # sharper focus to find), so we cap the usable range there too.
+    # Long-range note: if a subject past ~15 ft never comes sharp — the hunt
+    # keeps pushing toward 18000 and stopping there — the far-focus peak for
+    # this lens sits in the capped zone; try raising FOCUS_MAX toward 20000.
     FOCUS_MIN = 0
     FOCUS_MAX = 18000
 
@@ -91,11 +94,19 @@ class AutoFocusController:
                              # (rides out brief occlusions / motion blur)
     SETTLE_FRAMES   = 2      # fresh frames to average per measurement
 
-    # ── Sharpness ROI (fraction of frame, centred) ──────────────────────────
-    # The PTZ keeps the subject roughly centred, so a central window measures
-    # focus on the subject and ignores blurry/empty background at the edges.
-    ROI_X = (0.28, 0.72)
-    ROI_Y = (0.22, 0.78)
+    # ── Sharpness ROI ───────────────────────────────────────────────────────
+    # Half-extents of the measurement window as fractions of the frame. By
+    # default the window sits at frame centre (the PTZ keeps the subject
+    # roughly centred); set_roi_center() moves it to follow the tracked
+    # face, so at long range focus is judged on the person, not on whatever
+    # texture-rich background happens to fill the middle of the room.
+    ROI_HALF_W = 0.22
+    ROI_HALF_H = 0.28
+
+    # The Laplacian is computed on a fixed-width downscale of the ROI, so
+    # its cost (and its value scale) stays the same whether the capture is
+    # 640-wide or 1280-wide.
+    ROI_MEASURE_W = 288
 
     def __init__(self, focuser, io_lock, do_startup_sweep=True):
         self._focuser = focuser
@@ -106,6 +117,13 @@ class AutoFocusController:
         self._sample_lock  = threading.Lock()
         self._sharpness_val = None
         self._sample_id     = 0
+        self._roi_center    = None    # (cx, cy) normalized, or None = centre
+
+        # Hunts are suppressed while the zoom motor is actively moving —
+        # the focus plane is a moving target then, and every ramp frame
+        # looks "soft". The PTZ calls suppress() on each zoom step and
+        # trigger_refocus() once zoom settles (force bypasses suppression).
+        self._suppress_until = 0.0
 
         # Command flags set from the web thread, consumed by the worker.
         self._cmd_lock       = threading.Lock()
@@ -143,14 +161,33 @@ class AutoFocusController:
             self._sharpness_val = val
             self._sample_id += 1
 
-    @classmethod
-    def _sharpness(cls, frame):
+    def set_roi_center(self, center):
+        """
+        Aim the sharpness window at a normalized (cx, cy) — typically the
+        tracked face — or pass None to fall back to frame centre. Cheap;
+        called every vision-loop iteration.
+        """
+        with self._sample_lock:
+            self._roi_center = (None if center is None
+                                else (float(center[0]), float(center[1])))
+
+    def _sharpness(self, frame):
         h, w = frame.shape[:2]
-        x0, x1 = int(w * cls.ROI_X[0]), int(w * cls.ROI_X[1])
-        y0, y1 = int(h * cls.ROI_Y[0]), int(h * cls.ROI_Y[1])
+        with self._sample_lock:
+            center = self._roi_center
+        cx, cy = center if center is not None else (0.5, 0.5)
+        # Clamp so the window always stays fully inside the frame.
+        cx = min(max(cx, self.ROI_HALF_W), 1.0 - self.ROI_HALF_W)
+        cy = min(max(cy, self.ROI_HALF_H), 1.0 - self.ROI_HALF_H)
+        x0, x1 = int(w * (cx - self.ROI_HALF_W)), int(w * (cx + self.ROI_HALF_W))
+        y0, y1 = int(h * (cy - self.ROI_HALF_H)), int(h * (cy + self.ROI_HALF_H))
         roi = frame[y0:y1, x0:x1]
         if roi.ndim == 3:
             roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        if roi.shape[1] > self.ROI_MEASURE_W:
+            mh = max(1, int(roi.shape[0] * self.ROI_MEASURE_W / roi.shape[1]))
+            roi = cv2.resize(roi, (self.ROI_MEASURE_W, mh),
+                             interpolation=cv2.INTER_AREA)
         # Variance of the Laplacian: high for crisp edges, low when blurred.
         return float(cv2.Laplacian(roi, cv2.CV_64F).var())
 
@@ -172,14 +209,30 @@ class AutoFocusController:
             self._pending_manual = int(value)
 
     def trigger_refocus(self):
-        """Force a one-shot hunt right now (the 'Focus now' button)."""
+        """Force a one-shot hunt right now (the 'Focus now' button, and the
+        PTZ's zoom-settled callback). Bypasses suppress()."""
         with self._cmd_lock:
             self._force_hunt = True
+
+    def suppress(self, seconds):
+        """Hold off soft-frame-triggered hunts for `seconds` from now.
+        Called on every zoom step so AF doesn't chase a moving focus plane
+        mid-ramp; the settle callback's trigger_refocus() still gets through."""
+        until = time.monotonic() + float(seconds)
+        if until > self._suppress_until:
+            self._suppress_until = until
 
     # ── Reporting ───────────────────────────────────────────────────────────
     @property
     def mode(self):
         return self._mode
+
+    @property
+    def auto_enabled(self):
+        """True when this controller owns the focus motor. Automatic callers
+        of trigger_refocus() must check this — that method force-bypasses the
+        manual guard, which is only appropriate for a deliberate user press."""
+        return self._mode == MODE_AUTO
 
     @property
     def state(self):
@@ -236,6 +289,14 @@ class AutoFocusController:
                 continue
 
             # ── Continuous AF: watch, and hunt only when it goes soft ───────
+            if not force and time.monotonic() < self._suppress_until:
+                # Zoom is actively moving: every frame looks soft and the
+                # peak reference is meaningless. Don't trigger, don't let
+                # soft frames accumulate, don't poison the baseline.
+                soft_count = 0
+                time.sleep(0.05)
+                continue
+
             s = self._measure(settle_frames=1)
             if s is None:
                 time.sleep(0.05)

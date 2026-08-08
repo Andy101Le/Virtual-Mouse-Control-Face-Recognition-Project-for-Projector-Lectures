@@ -57,7 +57,16 @@ socket.on("session_error", (msg) => {
 function paintTelemetry(t) {
   if (!t) return;
   $("t-fps").textContent  = t.fps ?? "—";
-  $("t-zoom").textContent = t.zoom ? t.zoom.toFixed(2) + "×" : "—";
+  // Show the magnification the viewer actually gets (optical × digital).
+  // Once the lens is contributing, break it out — that's the only way to
+  // see whether the optical-first handoff is working or the digital crop
+  // is quietly doing all the work.
+  if (t.total_mag && t.zoom && t.total_mag > t.zoom + 0.01) {
+    $("t-zoom").textContent = t.total_mag.toFixed(2) + "× (opt "
+      + (t.total_mag / t.zoom).toFixed(2) + "× dig " + t.zoom.toFixed(2) + "×)";
+  } else {
+    $("t-zoom").textContent = t.zoom ? t.zoom.toFixed(2) + "×" : "—";
+  }
   $("t-mode").textContent = t.zoom_mode || "—";
   $("t-ptz").textContent  = t.ptz_state || "—";
   $("t-focus").textContent = t.focus != null ? t.focus : "—";

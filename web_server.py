@@ -64,9 +64,20 @@ btmgr   = BluetoothManager()
 # TILT_GPIO_PIN=18 routes tilt-servo pulses out that GPIO pin instead of
 # the Arducam board, whose tilt channel is dead — see gpio_tilt.py for
 # the diagnosis and wiring. Unset = drive the board as normal.
+#
+# PTZ_ZOOM=1 enables the OPTICAL auto-zoom (the zoom motor). It defaults
+# OFF because this board's zoom channel has never been confirmed to move
+# the lens — it is the same board whose tilt channel ACKs every write
+# while driving nothing, and a register readback proves only that the
+# write was accepted. Run test_zoom_sweep.py first: if the field of view
+# visibly narrows (not just sharpens — that is the focus motor), set
+# PTZ_ZOOM=1, and if the LOW end of the range is the telephoto one, also
+# set PTZController.ZOOM_TELE_AT_MAX = False. Digital auto-zoom in
+# zoom_webcam.py is unaffected by this and stays on either way.
 _tilt_pin = os.environ.get("TILT_GPIO_PIN")
 ptz     = PTZController(active_user=None,
-                        tilt_gpio_pin=int(_tilt_pin) if _tilt_pin else None)
+                        tilt_gpio_pin=int(_tilt_pin) if _tilt_pin else None,
+                        enable_zoom=os.environ.get("PTZ_ZOOM", "0") == "1")
 manual  = ManualPTZ(ptz)
 gesture = GestureSession(db, hid, ptz, socketio)
 
