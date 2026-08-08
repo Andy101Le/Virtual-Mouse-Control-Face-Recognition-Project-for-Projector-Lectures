@@ -394,6 +394,24 @@ def zoom_set():
     return jsonify(ok=True, telemetry=gesture.telemetry())
 
 
+@app.post("/api/controls")
+@login_required
+def controls_set():
+    """
+    Manual override for the open-palm master switch. Exists so the user is
+    never stranded: if the gesture stops registering — poor light, hand out
+    of frame, controls switched off from across the room — the browser can
+    always put control back.
+    """
+    body = request.json or {}
+    if "enabled" not in body:
+        return jsonify(error="Missing 'enabled'."), 400
+    state = gesture.control_toggle.set_enabled(bool(body["enabled"]))
+    socketio.emit("controls_toggled", gesture.control_toggle.status())
+    return jsonify(ok=True, controls_enabled=state,
+                   telemetry=gesture.telemetry())
+
+
 @app.get("/api/ptz/status")
 @login_required
 def ptz_status():

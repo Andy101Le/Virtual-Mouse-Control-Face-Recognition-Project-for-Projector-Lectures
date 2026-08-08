@@ -249,3 +249,44 @@ class HUDRenderer:
         cv2.rectangle(frame, (0, h - 48), (w, h - 20), (20, 20, 20), -1)
         cv2.putText(frame, banner_txt, (10, h - 27),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.60, banner_col, 2, cv2.LINE_AA)
+
+    @staticmethod
+    def draw_control_switch(frame, toggle, w, h):
+        """
+        Master-switch state: whether control output is live, and a filling
+        bar while an open palm is being held toward a toggle. The bar matters
+        more than it looks — without it there is no way to tell "the gesture
+        isn't being recognised" apart from "keep holding", and the user is
+        left guessing at a one-second wait.
+        """
+        if toggle is None:
+            return frame
+
+        on = toggle.enabled
+        txt = "CONTROLS ON" if on else "CONTROLS OFF — raise open palm to resume"
+        col = (0, 220, 0) if on else (0, 80, 255)
+
+        cv2.rectangle(frame, (0, 0), (w, 26), (20, 20, 20), -1)
+        cv2.putText(frame, txt, (10, 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, col, 2, cv2.LINE_AA)
+
+        p = toggle.hold_progress
+        if p > 0.0:
+            bar_w = int(w * 0.35)
+            x0, y0 = w - bar_w - 10, 6
+            cv2.rectangle(frame, (x0, y0), (x0 + bar_w, y0 + 14), (70, 70, 70), 1)
+            cv2.rectangle(frame, (x0, y0), (x0 + int(bar_w * p), y0 + 14),
+                          (0, 200, 255), -1)
+            cv2.putText(frame, "hold", (x0 - 34, y0 + 12),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 200, 255), 1,
+                        cv2.LINE_AA)
+        elif toggle.state != "armed":
+            # Fired already: tell them what the switch is waiting for, or
+            # they will keep holding the palm up wondering why nothing else
+            # happens.
+            hint = ("show peace sign to reset" if toggle.state == "await_peace"
+                    else "lower hand to re-arm")
+            cv2.putText(frame, hint, (w - 210, 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 255), 1,
+                        cv2.LINE_AA)
+        return frame

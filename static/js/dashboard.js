@@ -68,6 +68,7 @@ function paintTelemetry(t) {
     $("t-zoom").textContent = t.zoom ? t.zoom.toFixed(2) + "×" : "—";
   }
   $("t-mode").textContent = t.zoom_mode || "—";
+  reflectControls(t);
   $("t-ptz").textContent  = t.ptz_state || "—";
   $("t-focus").textContent = t.focus != null ? t.focus : "—";
   $("t-user").textContent = t.user_active ? (t.recognised || "you") : "not recognised";
@@ -169,6 +170,30 @@ if ($("hwzoom")) {
   $("hwzoom").onchange = () =>
     post("/api/ptz/set", { hw_zoom: Number($("hwzoom").value) }).catch(alertErr);
 }
+
+/* ── Master control switch (open-palm gesture, mirrored here) ─────────── */
+$("controls-enabled").onchange = () =>
+  post("/api/controls", { enabled: $("controls-enabled").checked })
+    .catch(alertErr);
+
+// The gesture can change this from across the room, so the switch has to
+// follow the server rather than assume the last click is still true. Don't
+// fight the user mid-click.
+function reflectControls(t) {
+  if (t.controls_enabled === undefined) return;
+  const box = $("controls-enabled");
+  if (document.activeElement !== box) box.checked = t.controls_enabled;
+  const label = $("controls-state");
+  if (!label) return;
+  if (t.controls_enabled) {
+    label.textContent = "";
+  } else {
+    label.textContent = "— paused";
+    label.style.color = "var(--danger, #c33)";
+  }
+}
+
+socket.on("controls_toggled", reflectControls);
 
 /* ── Digital auto-zoom ───────────────────────────────────────────────── */
 $("digizoom").oninput = () =>

@@ -45,6 +45,7 @@ from autofocus_controller import AutoFocusController
 from bt_cursor_controller import BTCursorController
 from face_recognizer import UNKNOWN_LABEL, FaceRecognizer
 from face_embedder import FaceEmbedder, AsyncFaceEmbedder
+from control_toggle import ControlToggle, is_toggle_pose
 
 log = logging.getLogger(__name__)
 
@@ -108,18 +109,18 @@ ROI_LOST_SECONDS    = 3.0    # nobody seen this long -> full-frame search
 ROI_UNRECOGNISED_SECONDS = 4.0
 ROI_RESEARCH_SECONDS     = 1.5
 
-# Pose head landmarks (MediaPipe pose: 0 nose, 2/5 eyes, 7/8 ears) and the
-# factor converting their span into the face-mesh bbox diagonal that
-# get_face_size() reports. Only the ratio's rough scale matters: it exists so
-# the crop keeps tightening as someone walks away and their face stops being
-# detectable at all — without it the last measured face size sticks forever
-# and the crop never engages in exactly the walk-away case it's built for.
 # How far past the control zone's half-width a hand may sit and still count
 # as the tracked user's. Slack above 1.0 because the zone is deliberately
 # sized for a COMFORTABLE extension, and a hand raised above the head or
 # stretched past it is still plainly theirs.
 HAND_OWNERSHIP_SLACK = 1.6
 
+# Pose head landmarks (MediaPipe pose: 0 nose, 2/5 eyes, 7/8 ears) and the
+# factor converting their span into the face-mesh bbox diagonal that
+# get_face_size() reports. Only the ratio's rough scale matters: it exists so
+# the crop keeps tightening as someone walks away and their face stops being
+# detectable at all — without it the last measured face size sticks forever
+# and the crop never engages in exactly the walk-away case it's built for.
 POSE_HEAD_IDS         = (0, 2, 5, 7, 8)
 POSE_FACE_SIZE_RATIO  = 1.7
 POSE_HEAD_VIS_THRESH  = 0.35
@@ -170,6 +171,7 @@ class GestureSession:
         self.hud       = None
         self.zoom      = None
         self.autofocus = None
+        self.control_toggle = ControlToggle(enabled=True)
         self.embedder  = None    # sync SFace, for enrollment
         self.identifier = None   # async SFace worker, for live recognition
 
@@ -718,6 +720,7 @@ class GestureSession:
             # frame — first MOVE hand in detection order claims it, so two
             # open palms don't yank the pointer back and forth.
             move_claimed = False
+            user_hand_pts = []
             if h_result.hand_landmarks:
                 for hand_id, hand in enumerate(h_result.hand_landmarks):
                     wrist   = np.array([hand[0].x, hand[0].y], dtype=np.float32)
@@ -738,6 +741,11 @@ class GestureSession:
                                     self.auth.face_nose_pos is not None and
                                     float(np.linalg.norm(
                                         wrist - self.auth.face_nose_pos)) < own_radius)
+
+                    if hand_is_user:
+                        # Collected for the open-palm master switch below,
+                        # which must only ever answer to the tracked user.
+                        user_hand_pts.append(sxyz)
 
                     line_col = (255, 0, 0) if hand_is_user else (0, 0, 200)
                     dot_col  = (0, 255, 0) if hand_is_user else (0, 0, 200)
@@ -760,7 +768,11 @@ class GestureSession:
                     hand_action_strs.append((s, col))
 
                     tip_px = (int(sp[8, 0]), int(sp[8, 1]))
-                    if hand_is_user:
+                    # A hand making a switch gesture is talking to the master
+                    # switch, not steering — see control_toggle.is_toggle_pose.
+                    talking_to_switch = hand_is_user and is_toggle_pose(sxyz)
+                    if (hand_is_user and self.control_toggle.enabled
+                            and not talking_to_switch):
                         if confirmed == 'MOVE':
                             if not move_claimed:
                                 move_claimed = True
@@ -775,8 +787,20 @@ class GestureSession:
                             # keep them from double-firing.
                             self.cursor.handle_action(confirmed, hand_id,
                                                       sxyz[8, :2])
-                    else:
+                    elif not hand_is_user:
                         self.hud.draw_blocked_hand(display, tip_px, zoom=self.zoom)
+
+            # Master switch: an open palm held by the tracked user toggles all
+            # control output. Evaluated AFTER the hand loop so it sees every
+            # hand this frame, and outside the enabled check so the gesture
+            # that switches control back ON is still watched while it's off.
+            if self.control_toggle.update(user_hand_pts, now_t,
+                                          nose_pos=self.auth.face_nose_pos,
+                                          face_size=self.auth.face_size):
+                state = "ENABLED" if self.control_toggle.enabled else "DISABLED"
+                log.info("Controls %s by open-palm gesture", state)
+                self.socketio.emit("controls_toggled",
+                                   self.control_toggle.status())
 
             detected = (set(range(len(h_result.hand_landmarks)))
                         if h_result.hand_landmarks else set())
@@ -788,6 +812,7 @@ class GestureSession:
                                       self.auth.user_active,
                                       self.auth.grace_remaining(now_t),
                                       AuthManager.TEMP_ACTIVATE, pw, ph)
+            self.hud.draw_control_switch(display, self.control_toggle, pw, ph)
             self.ptz.draw_debug_hud(display)
             display = self.zoom.draw_debug(display)
 
@@ -824,6 +849,7 @@ class GestureSession:
             # only one of the two understates the framing whenever the
             # handoff has the lens carrying most of the magnification.
             "total_mag":      round(self.zoom.total_mag, 2) if self.zoom else 1.0,
+            **self.control_toggle.status(),
             "focus":          self.autofocus.focus_position if self.autofocus else None,
             "focus_mode":     self.autofocus.mode if self.autofocus else None,
             "focus_state":    self.autofocus.state if self.autofocus else None,

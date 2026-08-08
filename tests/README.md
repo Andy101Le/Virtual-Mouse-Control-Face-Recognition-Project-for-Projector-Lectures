@@ -7,6 +7,7 @@ No camera, no I2C, no PTZ board — run them anywhere:
     python3 tests/test_detector_telephoto.py
     python3 tests/test_face_recognition.py
     python3 tests/test_control_zone.py
+    python3 tests/test_control_toggle.py
 
 They cover the logic that is easy to get silently wrong, not the hardware
 and not SFace's own accuracy (which needs real faces to measure).
@@ -43,6 +44,17 @@ also checks the zone is clamped by shifting rather than squashing (so
 sensitivity stays uniform left-to-right), that zone corners map exactly to
 screen corners, and that the hand-ownership radius tightens with distance
 instead of covering half the room.
+
+**`test_control_toggle.py`** — the open-palm master switch. The pose
+detectors are geometric rather than a model class (the Keras model has only
+five outputs), so they're testable without a camera: the test builds
+synthetic hands and checks open-palm and peace-sign detection hold under
+rotation and scale, and reject each other. It then drives the state machine
+through arm -> hold -> fire -> peace -> lower -> re-arm. The load-bearing
+assertion is that holding the palm up does NOT toggle repeatedly, which is
+the whole reason the reset sequence exists. Also checks a hand hanging at
+your side is ignored, bystander-only frames never toggle, and the dashboard
+override re-arms rather than leaving the switch mid-sequence.
 
 The face test copies `login_system.db` to a temp directory — it never
 writes to the real database.
