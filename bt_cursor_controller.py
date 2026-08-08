@@ -37,6 +37,12 @@ class BTCursorController:
     SCROLL_COOLDOWN = 1.2
     SCROLL_CLICKS   = 3     # wheel notches per ZOOM IN / ZOOM OUT gesture
 
+    # A peace sign sends a middle click. It has to be held briefly first:
+    # the pose passes through on the way to and from other hand shapes, and
+    # a middle click in a browser opens links in new tabs, so a false fire
+    # is disruptive rather than merely wrong.
+    MIDDLE_HOLD_SECONDS = 0.20
+
     # ── Reach-based control zone ────────────────────────────────────────────
     # The zone used to be a fixed box (0.15..0.85 of the frame) at every
     # distance, which meant reaching the screen edge required sweeping your
@@ -107,6 +113,12 @@ class BTCursorController:
 
         self._last_click_time  = {}
         self._last_scroll_time = {}
+
+        # Peace-sign middle click, tracked per hand. Edge-triggered: the sign
+        # must appear, persist, fire ONCE, and then be released before it can
+        # fire again — holding two fingers up is not a stream of clicks.
+        self._peace_since   = {}
+        self._peace_latched = {}
 
     # ── Control zone ────────────────────────────────────────────────────────
     def set_control_zone(self, anchor, face_size, detect_window=None):
@@ -203,6 +215,42 @@ class BTCursorController:
         sx = float(np.clip((nx - x0) / max(x1 - x0, 1e-6), 0.0, 1.0))
         sy = float(np.clip((ny - y0) / max(y1 - y0, 1e-6), 0.0, 1.0))
         return sx, sy
+
+    def peace_click(self, hand_id, showing, now_t):
+        """
+        Middle click from a sustained peace sign. Call every frame for every
+        user hand; pass showing=False whenever the sign isn't there OR isn't
+        allowed to act, which both resets the timer.
+
+        Passing showing=False for "not allowed" is deliberate. The master
+        switch borrows the peace sign as its reset step, and if that were
+        merely ignored rather than reset, the sign would still be up at the
+        moment the switch finished re-arming and a middle click would fire
+        immediately afterwards — exactly the conflict this is avoiding.
+
+        Returns True if a click was actually sent.
+        """
+        if not showing:
+            self._peace_since.pop(hand_id, None)
+            self._peace_latched.pop(hand_id, None)
+            return False
+
+        if self._peace_latched.get(hand_id):
+            return False            # already fired for this instance
+        started = self._peace_since.setdefault(hand_id, now_t)
+        if (now_t - started) < self.MIDDLE_HOLD_SECONDS:
+            return False
+
+        last = self._last_click_time.get(hand_id, 0.0)
+        if (now_t - last) < self.CLICK_COOLDOWN:
+            return False            # shares the cooldown with left/right
+
+        self._peace_latched[hand_id] = True
+        if not self.hid.connected:
+            return False
+        self.hid.click('middle')
+        self._last_click_time[hand_id] = now_t
+        return True
 
     def handle_action(self, confirmed, hand_id, tip_xy):
         """

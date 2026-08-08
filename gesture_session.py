@@ -45,7 +45,7 @@ from autofocus_controller import AutoFocusController
 from bt_cursor_controller import BTCursorController
 from face_recognizer import UNKNOWN_LABEL, FaceRecognizer
 from face_embedder import FaceEmbedder, AsyncFaceEmbedder
-from control_toggle import ControlToggle, is_toggle_pose
+from control_toggle import ControlToggle, is_toggle_pose, is_peace_sign
 
 log = logging.getLogger(__name__)
 
@@ -771,6 +771,20 @@ class GestureSession:
                     # A hand making a switch gesture is talking to the master
                     # switch, not steering — see control_toggle.is_toggle_pose.
                     talking_to_switch = hand_is_user and is_toggle_pose(sxyz)
+
+                    # Peace sign = middle click, EXCEPT while the master
+                    # switch is using it as its own reset step. Note the
+                    # click is dispatched here rather than through the Keras
+                    # model, which has no middle-click class; the pose is
+                    # read geometrically like the switch gestures are.
+                    peace_for_click = (hand_is_user
+                                       and self.control_toggle.enabled
+                                       and not self.control_toggle.owns_peace_sign
+                                       and is_peace_sign(sxyz))
+                    if self.cursor.peace_click(hand_id, peace_for_click, now_t):
+                        hand_action_strs.append(
+                            (f"H{hand_id}: MIDDLE CLICK", (0, 200, 0)))
+
                     if (hand_is_user and self.control_toggle.enabled
                             and not talking_to_switch):
                         if confirmed == 'MOVE':

@@ -8,6 +8,7 @@ No camera, no I2C, no PTZ board — run them anywhere:
     python3 tests/test_face_recognition.py
     python3 tests/test_control_zone.py
     python3 tests/test_control_toggle.py
+    python3 tests/test_middle_click.py
 
 They cover the logic that is easy to get silently wrong, not the hardware
 and not SFace's own accuracy (which needs real faces to measure).
@@ -55,6 +56,22 @@ assertion is that holding the palm up does NOT toggle repeatedly, which is
 the whole reason the reset sequence exists. Also checks a hand hanging at
 your side is ignored, bystander-only frames never toggle, and the dashboard
 override re-arms rather than leaving the switch mid-sequence.
+
+**`test_middle_click.py`** — the peace-sign middle click and, mainly, its
+boundary with the master switch. The peace sign has two jobs: normally it
+sends a middle click, but the switch borrows it as the reset step of its
+toggle sequence. The important case is switching controls back ON, because
+afterwards controls are enabled and the reset peace sign would otherwise be
+a live middle click — the test drives that whole sequence and asserts zero
+clicks, then asserts a peace sign clicks again once the switch has
+re-armed. Also covers: a held sign fires exactly once rather than
+streaming, a brief flicker of the pose fires nothing, nothing fires while
+controls are paused, and a disconnected host doesn't silently swallow a
+click by latching it.
+
+`_hands.py` holds the synthetic hand builder shared by the gesture tests,
+so importing a helper doesn't run another suite's assertions as a side
+effect.
 
 The face test copies `login_system.db` to a temp directory — it never
 writes to the real database.

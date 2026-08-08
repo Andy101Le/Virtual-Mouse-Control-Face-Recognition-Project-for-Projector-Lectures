@@ -133,6 +133,26 @@ class ControlToggle:
 
     # ── Reporting ───────────────────────────────────────────────────────────
     @property
+    def owns_peace_sign(self):
+        """
+        True while the switch is using the peace sign as its own reset step,
+        so nothing else may act on it.
+
+        This covers the whole post-fire sequence, not just the frame the
+        peace sign appears. Once an open palm has toggled, the switch is
+        waiting for peace-then-lower; a peace sign anywhere in that window
+        belongs to the reset. Only after the hand has been lowered and the
+        switch is ARMED again does the peace sign go back to meaning
+        "middle click".
+
+        Without this the second half of a toggle would double as a click:
+        switching controls back ON leaves them enabled, so the very next
+        gesture — the reset peace sign — would fire a middle click the user
+        never asked for.
+        """
+        return self.state != ARMED
+
+    @property
     def hold_progress(self):
         """0..1 through the open-palm hold, for the HUD countdown. 0 unless
         an open palm is actually being held right now."""
