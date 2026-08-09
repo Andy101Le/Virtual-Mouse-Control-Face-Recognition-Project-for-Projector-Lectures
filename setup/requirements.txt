@@ -1,5 +1,21 @@
+# TensorFlow and Keras are deliberately absent. The gesture MLP used to run
+# under Keras; gesture_mlp.py now does the forward pass in numpy, reading the
+# weights out of landmark_gesture_model.h5 with h5py. Nothing the server runs
+# imports TensorFlow any more, and leaving it installed costs ~400 MB of RSS
+# in the server process, because mediapipe imports it unconditionally for a
+# documentation decorator (mediapipe/tasks/python/core/optional_dependencies.py,
+# which falls back to a no-op when the import fails).
+#
+# h5py is therefore a DIRECT requirement now, not a leftover TensorFlow
+# dependency -- do not let a dependency cleanup take it with TF.
+#
+# Only tests/test_gesture_mlp.py still wants TensorFlow, to check the numpy
+# forward pass still matches Keras exactly. It skips that comparison when TF
+# is missing. Install `tensorflow-cpu-aws==2.15.1` and `keras` into a
+# development environment -- not the server's -- and re-run that suite after
+# retraining the model.
+
 absl-py==2.4.0
-astunparse==1.6.3
 attrs==26.1.0
 certifi==2026.4.22
 cffi==2.0.0
@@ -8,48 +24,31 @@ contourpy==1.3.3
 cycler==0.12.1
 flatbuffers==25.12.19
 fonttools==4.63.0
-gast==0.7.0
-google-pasta==0.2.0
-grpcio==1.80.0
 h5py==3.14.0
 idna==3.15
 jax==0.4.34
 jaxlib==0.4.34
-keras==3.14.1
 kiwisolver==1.5.0
-libclang==18.1.1
-Markdown==3.10.2
-markdown-it-py==4.2.0
 MarkupSafe==3.0.3
 matplotlib==3.10.9
-mdurl==0.1.2
 mediapipe==0.10.14
 ml-dtypes==0.3.2
-namex==0.1.0
 numpy==1.26.4
 opencv-contrib-python==4.11.0.86
 opencv-python==4.11.0.86
 opt_einsum==3.4.0
-optree==0.19.1
 packaging==26.2
 pillow==12.2.0
 protobuf==4.25.9
 pycparser==3.0
-Pygments==2.20.0
 pyparsing==3.3.2
 python-dateutil==2.9.0.post0
 requests==2.34.2
-rich==15.0.0
 scipy==1.17.1
 setuptools==82.0.1
 six==1.17.0
 sounddevice==0.5.5
-tensorboard==2.16.2
-tensorboard-data-server==0.7.2
-tensorflow-aarch64==2.16.1
-termcolor==3.3.0
 typing_extensions==4.15.0
 urllib3==2.7.0
 Werkzeug==3.1.8
 wheel==0.47.0
-wrapt==2.1.2
