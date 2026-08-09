@@ -16,3 +16,6 @@ chat_logs/
 /*.pki
 /*.db
 /*.pkl
+
+# Low-light diagnostic CSVs (scene_light.py)
+logs/

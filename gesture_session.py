@@ -46,6 +46,7 @@ from bt_cursor_controller import BTCursorController
 from face_recognizer import UNKNOWN_LABEL, FaceRecognizer
 from face_embedder import FaceEmbedder, AsyncFaceEmbedder
 from control_toggle import ControlToggle, is_toggle_pose, is_peace_sign
+from scene_light import SceneLightLog
 
 log = logging.getLogger(__name__)
 
@@ -171,6 +172,7 @@ class GestureSession:
         # boot (and show a useful error page) even if a model file is
         # missing or the camera is busy.
         self.cam       = None
+        self.light_log = None
         self.landmarks = None
         self.auth      = None
         self.gestures  = None
@@ -205,6 +207,8 @@ class GestureSession:
             self.cam.release()
         if self.landmarks:
             self.landmarks.close()
+        if getattr(self, "light_log", None):
+            self.light_log.close()
 
     def set_suspended(self, suspended):
         """
@@ -428,6 +432,27 @@ class GestureSession:
                                ROI_SMOOTH * value +
                                (1 - ROI_SMOOTH) * self._roi_face_size)
 
+    def _tracked_face(self, cached_face_lms):
+        """The face mesh AuthManager settled on this frame, matched back by
+        nose position, or None. AuthManager reports the chosen face's nose
+        but not the mesh itself, and the photometric reading has to be of
+        the face we are actually trying to recognise rather than of
+        whichever face MediaPipe happened to list first."""
+        anchor = self.auth.face_nose_pos
+        if not cached_face_lms or anchor is None:
+            return None
+        best, best_d = None, None
+        for lms in cached_face_lms:
+            nose = self.face_rec_nose(lms)
+            d = (nose[0] - anchor[0]) ** 2 + (nose[1] - anchor[1]) ** 2
+            if best_d is None or d < best_d:
+                best, best_d = lms, d
+        return best
+
+    @staticmethod
+    def face_rec_nose(face_lms):
+        return FaceRecognizer.get_nose_tip(face_lms)
+
     @staticmethod
     def _pose_face_size(pose_lms):
         """Face size estimated from pose head landmarks, on the same scale
@@ -487,6 +512,7 @@ class GestureSession:
             pose_detect_hz=POSE_DETECT_HZ,
         )
         self.cam = CameraManager(width=CAPTURE_W, height=CAPTURE_H, fps=30)
+        self.light_log = SceneLightLog()
 
         # Face identity. One embedding costs ~56 ms, so live recognition runs
         # on a worker thread and the loop consumes whatever it last published;
@@ -631,6 +657,27 @@ class GestureSession:
             self._update_roi(cached_pose_lms, now_t)
             if self.autofocus is not None:
                 self.autofocus.set_roi_center(self._roi_center)
+
+            # Low-light diagnostics. Off unless LOWLIGHT_LOG is set, and the
+            # measurement is deliberately taken on the UNFLIPPED-geometry
+            # frame the detectors saw, so the boxes line up with the
+            # landmarks. Costs nothing when disabled.
+            if self.light_log is not None and self.light_log.enabled:
+                self.light_log.maybe_log(
+                    now_t, frame,
+                    frame_n=frame_n, fps=self.fps,
+                    metadata=self.cam.last_metadata,
+                    face_landmarks=self._tracked_face(cached_face_lms),
+                    pose_lms_list=cached_pose_lms,
+                    n_faces=len(cached_face_lms),
+                    roi_center=self._roi_center,
+                    roi_face_size=self._roi_face_size,
+                    face_size=self.auth.face_size,
+                    recognised=self.auth.recognised_user,
+                    score=self.auth.recog_score,
+                    auth_temp=self.auth.auth_temp,
+                    user_active=self.auth.user_active,
+                )
 
             # PTZ auto-tracking. In manual mode the controller is disabled
             # (see ptz_manual.ManualPTZ), so these calls become no-ops

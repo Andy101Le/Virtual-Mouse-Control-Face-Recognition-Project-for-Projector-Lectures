@@ -11,6 +11,7 @@ No camera, no I2C, no PTZ board — run them anywhere:
     python3 tests/test_middle_click.py
     python3 tests/test_gesture_mlp.py
     python3 tests/test_pose_rate.py
+    python3 tests/test_scene_light.py
 
 They cover the logic that is easy to get silently wrong, not the hardware
 and not SFace's own accuracy (which needs real faces to measure).
@@ -95,6 +96,21 @@ that a faster loop doesn't spend the gain on more detections, and that
 falling behind produces one detection rather than a catch-up burst. Measured
 saving at the ~12 fps this pipeline achieves: 8.8 ms/frame, rising to
 17.6 ms/frame if the loop ever reaches 30.
+
+**`test_scene_light.py`** — the low-light instrumentation. Its job is to
+separate two failures that look identical from inside the detector ("no face
+found"): a uniformly dim room, which needs more light, and a subject who is
+dark only because the projector screen behind them is bright, which needs
+different metering and gets no benefit from more exposure. The test builds
+both frames synthetically and asserts the subject/scene luminance ratio
+separates them (1.07 vs 0.18). It then walks the region-selection fallbacks
+— face, then pose head, then tracked crop, then whole frame — because the
+measurement has to survive exactly the moment the face stops being
+detectable. Also covers clamping rects to the frame, the sample grid being
+centred so a side-lit face isn't read from its dark half, a bystander not
+capturing the measurement, and the logger's two behaviours: rate-limiting
+redundant samples, and forcing a row the instant a face or the auth state is
+lost, which is the row worth having.
 
 `_hands.py` holds the synthetic hand builder shared by the gesture tests,
 so importing a helper doesn't run another suite's assertions as a side
