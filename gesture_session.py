@@ -467,7 +467,7 @@ class GestureSession:
     def _build(self):
         self.auth      = AuthManager(active_user=self.active_user,
                                      face_detect_interval=FACE_DETECT_INTERVAL)
-        self.gestures  = GestureEngine(GESTURE_MODEL_PATH, num_hands=NUM_HANDS)
+        self.gestures  = GestureEngine(GESTURE_MODEL_PATH)
         self.cursor    = BTCursorController(self.hid)
         self.hud       = HUDRenderer(num_registered=self.auth.num_registered)
         self.zoom      = ZoomWebcamController(

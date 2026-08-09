@@ -9,7 +9,7 @@ scrolls. Do it again to bring them back. The camera keeps tracking and the
 preview keeps running throughout, so the gesture that re-enables control is
 still seen and you stay framed while paused.
 
-WHY THIS IS NOT A MODEL CLASS. GestureEngine's Keras model has exactly five
+WHY THIS IS NOT A MODEL CLASS. GestureEngine's gesture model has exactly five
 outputs (MOVE, LEFT/RIGHT CLICK, ZOOM IN/OUT); adding a sixth would mean
 retraining it. An open palm is also one of the easiest poses to identify
 geometrically, so it is detected here directly from the 21 hand landmarks

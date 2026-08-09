@@ -9,6 +9,7 @@ No camera, no I2C, no PTZ board — run them anywhere:
     python3 tests/test_control_zone.py
     python3 tests/test_control_toggle.py
     python3 tests/test_middle_click.py
+    python3 tests/test_gesture_mlp.py
 
 They cover the logic that is easy to get silently wrong, not the hardware
 and not SFace's own accuracy (which needs real faces to measure).
@@ -68,6 +69,19 @@ re-armed. Also covers: a held sign fires exactly once rather than
 streaming, a brief flicker of the pose fires nothing, nothing fires while
 controls are paused, and a disconnected host doesn't silently swallow a
 click by latching it.
+
+**`test_gesture_mlp.py`** — the numpy replacement for the Keras gesture
+model. `gesture_mlp.py` re-implements the forward pass by hand, so the only
+thing that makes it safe is being numerically identical to what it replaced:
+the test compares the two over 800 rows of random and synthetic-hand inputs
+and asserts no argmax disagreements and no flips across the 0.75 confidence
+gate (worst probability difference measured: 3.7e-06). It also checks the
+loader rejects architectures it cannot reproduce rather than quietly
+computing something else, and that BatchNorm — which sits *after* the ReLU
+here and so cannot be folded into the preceding Dense — is handled
+correctly. **This is the one suite that needs TensorFlow.** It skips the
+comparison if TF is missing, so re-run it with TF installed after any
+retraining.
 
 `_hands.py` holds the synthetic hand builder shared by the gesture tests,
 so importing a helper doesn't run another suite's assertions as a side

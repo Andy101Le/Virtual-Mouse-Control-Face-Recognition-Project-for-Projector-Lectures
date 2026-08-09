@@ -3,10 +3,14 @@ gesture_engine.py
 ──────────────────
 Turns raw per-hand MediaPipe landmarks into a debounced gesture label.
 
-Each hand gets its own background InferenceWorker so the (relatively
-slow) Keras model never blocks the main camera loop — the worker always
-holds the most recent classification result, and main.py just asks for
-whatever's currently available.
+Classification runs inline on the camera thread. It used to run on a
+background worker per hand, because the Keras model cost ~9 ms per call
+and would have blocked the loop; the numpy forward pass in
+`gesture_mlp.py` costs ~0.08 ms, so the queue, thread and lock cost more
+than the work they were deferring. Running inline also removes the lag
+they introduced — the worker held the *previous* frame's result, and
+dropped submissions whenever it fell behind, so a gesture took its
+debounce window plus however far the worker had slipped to confirm.
 
 Also owns the EMA smoothing applied to raw hand landmarks before they're
 drawn or fed to the model, and the debounce counter that requires a
@@ -15,10 +19,9 @@ gesture to repeat for DEBOUNCE_FRAMES consecutive frames before it's
 triggering a click).
 """
 
-import queue
-import threading
 import numpy as np
-from keras.models import load_model
+
+from gesture_mlp import GestureMLP
 
 LABEL_MAP = {
     0: 'MOVE', 1: 'LEFT CLICK', 2: 'RIGHT CLICK', 3: 'ZOOM IN', 4: 'ZOOM OUT',
@@ -33,53 +36,17 @@ FINGER_CHAINS = [
 SMOOTHING_ALPHA = np.float32(0.3)
 ONE_MINUS_ALPHA = np.float32(0.7)
 
-
-class _InferenceWorker:
-    """Runs the Keras gesture model on a background thread for one hand."""
-
-    def __init__(self, model):
-        self._model  = model
-        self._q      = queue.Queue(maxsize=1)
-        self._result = ('MOVE', 1.0)
-        self._lock   = threading.Lock()
-        threading.Thread(target=self._run, daemon=True).start()
-
-    def submit(self, features):
-        try:
-            self._q.put_nowait(features)
-        except queue.Full:
-            pass
-
-    def result(self):
-        with self._lock:
-            return self._result
-
-    def _run(self):
-        while True:
-            data = self._q.get()
-            # data is a (2, 63) batch: the hand's features and their
-            # x-mirrored twin (see GestureEngine.classify). Keep whichever
-            # orientation the model is more confident about — the wrong
-            # chirality reads as an unfamiliar pose and scores low.
-            raw  = self._model(data, training=False).numpy()
-            row  = raw[int(np.argmax(np.max(raw, axis=1)))]
-            idx  = int(np.argmax(row))
-            conf = float(row[idx])
-            act  = LABEL_MAP.get(idx, 'NO ACTION') if conf >= 0.75 else 'NO ACTION'
-            with self._lock:
-                self._result = (act, conf)
+# Below this the winning class is treated as no gesture at all, so an
+# ambiguous pose can't fire a click on its way to somewhere else.
+CONFIDENCE_THRESHOLD = 0.75
 
 
 class GestureEngine:
     DEBOUNCE_FRAMES = 5
 
-    def __init__(self, model_path, num_hands=2):
-        self.gesture_model = load_model(model_path)
-        # Warm up so the first real frame isn't slowed by lazy graph tracing
-        self.gesture_model(np.zeros((1, 63), dtype=np.float32), training=False)
-        print(f"Gesture model loaded — {self.gesture_model.output_shape[-1]} classes")
-
-        self._workers = {i: _InferenceWorker(self.gesture_model) for i in range(num_hands)}
+    def __init__(self, model_path):
+        self.gesture_model = GestureMLP(model_path)
+        print(f"Gesture model loaded — {self.gesture_model.n_classes} classes")
 
         self._smoothed_xyz     = {}
         self._gesture_counters = {}
@@ -97,24 +64,30 @@ class GestureEngine:
         return sxyz
 
     def classify(self, hand_id, smoothed_xyz):
-        """Submit this hand's normalised pose to its worker and return the
-        debounced (confirmed_action, confidence) pair."""
+        """Classify this hand's normalised pose and return the debounced
+        (confirmed_action, confidence) pair."""
         pts_n  = smoothed_xyz - smoothed_xyz[0]
         scale  = np.max(np.abs(pts_n)) or 1.0
         pts_n /= scale
         # The model was trained on right-hand samples only, so a left hand
         # (an x-mirrored image of the training data) misclassifies. Rather
         # than trust MediaPipe's handedness label (unreliable on partial
-        # views), submit the features AND their x-mirrored twin as one
-        # batch — the worker keeps the higher-confidence orientation, so
-        # either physical hand matches the training chirality. Mirroring
-        # after normalisation is safe: negating x changes neither the
+        # views), classify the features AND their x-mirrored twin as one
+        # batch and keep whichever orientation scores higher — the wrong
+        # chirality reads as an unfamiliar pose and scores low, so either
+        # physical hand matches the training chirality. Mirroring after
+        # normalisation is safe: negating x changes neither the
         # wrist-relative origin nor the max-abs scale.
         mirrored = pts_n * np.float32([-1.0, 1.0, 1.0])
         batch = np.stack([pts_n.reshape(63),
                           mirrored.reshape(63)]).astype(np.float32)
-        self._workers[hand_id].submit(batch)
-        action, confidence = self._workers[hand_id].result()
+
+        probs      = self.gesture_model(batch)
+        row        = probs[int(np.argmax(np.max(probs, axis=1)))]
+        idx        = int(np.argmax(row))
+        confidence = float(row[idx])
+        action     = (LABEL_MAP.get(idx, 'NO ACTION')
+                      if confidence >= CONFIDENCE_THRESHOLD else 'NO ACTION')
 
         gc = self._gesture_counters.setdefault(
             hand_id, {'name': action, 'count': 0, 'confirmed': action})
