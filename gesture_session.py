@@ -56,7 +56,14 @@ GESTURE_MODEL_PATH = "landmark_gesture_model.h5"
 
 NUM_HANDS            = 2
 FACE_DETECT_INTERVAL = 3
-POSE_DETECT_INTERVAL = 2
+# Pose is the most expensive detector in the loop (~37 ms/call, vs 39 ms for
+# the hand landmarker that runs every frame), and it feeds only slow, smoothed
+# consumers: the PTZ's coarse fallback when the face is lost, the auto-zoom
+# framing, and the detection crop's anchor. All three read the CACHED result
+# every frame, so their smoothing rates are unchanged by detecting less often
+# — only the anchor's freshness degrades, by at most 200 ms. Rate rather than
+# frame interval; see LandmarkPipeline.
+POSE_DETECT_HZ = 5.0
 
 FACE_SAMPLES_NEEDED = 60
 FACE_SAMPLE_DELAY   = 0.05
@@ -477,7 +484,7 @@ class GestureSession:
             HAND_TASK_PATH, FACE_TASK_PATH, POSE_TASK_PATH,
             num_hands=NUM_HANDS,
             face_detect_interval=FACE_DETECT_INTERVAL,
-            pose_detect_interval=POSE_DETECT_INTERVAL,
+            pose_detect_hz=POSE_DETECT_HZ,
         )
         self.cam = CameraManager(width=CAPTURE_W, height=CAPTURE_H, fps=30)
 

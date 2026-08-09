@@ -10,6 +10,7 @@ No camera, no I2C, no PTZ board — run them anywhere:
     python3 tests/test_control_toggle.py
     python3 tests/test_middle_click.py
     python3 tests/test_gesture_mlp.py
+    python3 tests/test_pose_rate.py
 
 They cover the logic that is easy to get silently wrong, not the hardware
 and not SFace's own accuracy (which needs real faces to measure).
@@ -82,6 +83,18 @@ here and so cannot be folded into the preceding Dense — is handled
 correctly. **This is the one suite that needs TensorFlow.** It skips the
 comparison if TF is missing, so re-run it with TF installed after any
 retraining.
+
+**`test_pose_rate.py`** — how often the pose landmarker runs, which is
+purely a performance decision: it is the most expensive detector in the loop
+(~53 ms/call measured under load) and feeds only slow, smoothed consumers.
+It used to run every 2nd frame, tying its rate to the loop's frame rate, so
+any speed-up elsewhere was immediately spent on more pose detections. It now
+runs at a fixed 5 Hz off the frame timestamp. The test asserts the target is
+a *ceiling* — a slow loop rounds the rate down, which is the safe direction —
+that a faster loop doesn't spend the gain on more detections, and that
+falling behind produces one detection rather than a catch-up burst. Measured
+saving at the ~12 fps this pipeline achieves: 8.8 ms/frame, rising to
+17.6 ms/frame if the loop ever reaches 30.
 
 `_hands.py` holds the synthetic hand builder shared by the gesture tests,
 so importing a helper doesn't run another suite's assertions as a side

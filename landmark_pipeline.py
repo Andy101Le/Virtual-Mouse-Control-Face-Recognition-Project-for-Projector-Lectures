@@ -7,8 +7,16 @@ scheduling so main.py's loop doesn't have to.
 
 Hand detection is cheap and responsive enough to run every frame.
 Face and pose move more slowly, so their results are only refreshed
-every FACE_DETECT_INTERVAL / POSE_DETECT_INTERVAL frames and cached
-in between.
+periodically and cached in between: face every FACE_DETECT_INTERVAL
+frames, pose at a fixed POSE_DETECT_HZ rate.
+
+Pose is scheduled in *time*, not frames, because it is the most
+expensive detector and the loop's frame rate is neither 30 fps nor
+stable. A frame-count interval silently changes the pose rate whenever
+the rest of the pipeline speeds up or slows down — exactly the coupling
+you don't want on the component you are rate-limiting to save time.
+Face stays frame-counted: AuthManager derives its temperature
+rise/fall per update from face_detect_interval, so the two must agree.
 """
 
 import os
@@ -19,9 +27,12 @@ from mediapipe.tasks.python.core.base_options import BaseOptions
 class LandmarkPipeline:
     def __init__(self,
                  hand_task_path, face_task_path, pose_task_path,
-                 num_hands=2, face_detect_interval=3, pose_detect_interval=2):
+                 num_hands=2, face_detect_interval=3, pose_detect_hz=5.0):
         self.face_detect_interval = face_detect_interval
-        self.pose_detect_interval = pose_detect_interval
+        self.pose_detect_hz       = pose_detect_hz
+        self._pose_period_ms      = (1000.0 / pose_detect_hz
+                                     if pose_detect_hz > 0 else float("inf"))
+        self._last_pose_ms        = None
 
         self.hand_landmarker = vision.HandLandmarker.create_from_options(
             vision.HandLandmarkerOptions(
@@ -97,10 +108,27 @@ class LandmarkPipeline:
                 lm.y = off_y + lm.y * s
                 lm.z = lm.z * s
 
+    def _pose_due(self, timestamp_ms):
+        """
+        True when POSE_DETECT_HZ says pose detection should run on this
+        frame. The elapsed time is deliberately measured against the last
+        frame pose actually RAN on, not against a fixed grid: falling
+        behind must not queue up catch-up detections on the one component
+        being rate-limited to keep the loop fast.
+
+        A timestamp that goes backwards (a restarted clock) reschedules
+        immediately rather than stalling until the old deadline.
+        """
+        if self._last_pose_ms is None:
+            return True
+        elapsed = timestamp_ms - self._last_pose_ms
+        return elapsed >= self._pose_period_ms or elapsed < 0
+
     def detect(self, mp_image, frame_number, timestamp_ms, transform=None):
         """
-        Runs hand detection every call, and face/pose detection only on
-        their own interval (results are cached in between).
+        Runs hand detection every call; face detection every
+        face_detect_interval frames and pose detection at pose_detect_hz
+        (results are cached in between).
 
         transform: pass (off_x, off_y, scale) when mp_image is a crop of
         the full frame (the long-range "detector telephoto"): every FRESH
@@ -132,7 +160,8 @@ class LandmarkPipeline:
             self.cached_face_lms = f_result.face_landmarks
             face_updated = True
 
-        if self.pose_landmarker is not None and frame_number % self.pose_detect_interval == 0:
+        if self.pose_landmarker is not None and self._pose_due(timestamp_ms):
+            self._last_pose_ms = timestamp_ms
             p_result = self.pose_landmarker.detect_for_video(mp_image, timestamp_ms)
             if transform is not None and p_result.pose_landmarks:
                 self._remap(p_result.pose_landmarks, transform)
