@@ -213,7 +213,12 @@ class SceneLightLog:
         self._last_state = None
         self.path = None
 
-        env = os.environ.get("LOWLIGHT_LOG", "") if path is None else str(path)
+        # Stripped because this is usually typed into an IDE run-configuration
+        # field, where a trailing space is invisible and would otherwise be
+        # taken as a filename -- logging to a file called "1 " instead of
+        # failing loudly enough to notice.
+        env = (os.environ.get("LOWLIGHT_LOG", "") if path is None
+               else str(path)).strip()
         if not env or env == "0":
             return
 
