@@ -14,6 +14,7 @@ No camera, no I2C, no PTZ board — run them anywhere:
     python3 tests/test_scene_light.py
     python3 tests/test_input_latency.py
     python3 tests/test_tracking_dropout.py
+    python3 tests/test_zoom_stability.py
 
 They cover the logic that is easy to get silently wrong, not the hardware
 and not SFace's own accuracy (which needs real faces to measure).
@@ -149,6 +150,19 @@ consumer that didn't. The test replays that miss sequence frame by frame and
 asserts ownership never lapses. It also covers the second half — a resume
 uses a gentler time constant so the correction glides rather than teleports,
 expires on schedule, and doesn't slow down uninterrupted steering.
+
+**`test_zoom_stability.py`** — the optical auto-zoom at range. Walking away
+made recognition flicker, and the camera answered by zooming in and out and
+refocusing continuously, which degraded the image and so degraded
+recognition further. Two amplifiers, both covered. The dwell counter that
+exists to "ride out single noisy size readings" was direction-agnostic, so
+three ticks of "face too small" followed by ONE oversized misdetection fired
+a zoom OUT — a single outlier spending the credit the opposite direction had
+built. And every settled zoom asked for a full autofocus hunt, including an
+in-then-out pair that left the lens where it started; the settle event now
+reports NET travel and a hunt needs more than a single nudge. Note what the
+tests deliberately do not claim: the decision runs on the SMOOTHED size, so
+noise whose mean sits outside the band still moves the lens, correctly.
 
 `_hands.py` holds the synthetic hand builder shared by the gesture tests,
 so importing a helper doesn't run another suite's assertions as a side

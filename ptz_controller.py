@@ -164,8 +164,9 @@ class PTZController:
     ZOOM_STEP_INTERVAL = 0.20   # min seconds between zoom writes — keeps the
                                 # shared I2C bus responsive for pan/tilt
     ZOOM_DWELL_TICKS   = 4      # face must sit outside the band this many
-                                # consecutive snapshots before zoom moves
-                                # (rides out single noisy size readings)
+                                # consecutive snapshots IN THE SAME DIRECTION
+                                # before zoom moves (rides out single noisy
+                                # size readings — see _auto_zoom_track)
     ZOOM_SETTLE_S      = 0.6    # zoom idle this long after moving -> fire
                                 # on_zoom_settled (autofocus re-hunts then)
 
@@ -254,9 +255,12 @@ class PTZController:
 
         # Auto-zoom state
         self._smoothed_face_size = None
-        self._zoom_dwell         = 0     # consecutive out-of-band snapshots
+        self._zoom_dwell         = 0     # consecutive same-direction snapshots
+        self._zoom_dwell_dir     = 0     # +1 = wants tele, -1 = wants wide
         self._zoom_last_step_t   = 0.0
-        self._zoom_moved_accum   = 0     # units moved since last settle event
+        self._zoom_net_units     = 0     # SIGNED units moved since the last
+                                         # settle event — see
+                                         # _auto_zoom_check_settled
         self._zoom_last_move_t   = 0.0
 
         # Commanded targets (NOT re-read from hardware every tick — see _Targets)
@@ -422,6 +426,7 @@ class PTZController:
         self._accum_x = self._accum_y = 0.0
         self._smoothed_face_size  = None
         self._zoom_dwell          = 0
+        self._zoom_dwell_dir      = 0
 
     def get_state(self) -> str:
         return self._state
@@ -676,10 +681,26 @@ class PTZController:
             zoom_in = False
         else:
             self._zoom_dwell = 0
+            self._zoom_dwell_dir = 0
             return
 
         # Require the face to sit outside the band for several consecutive
-        # snapshots — one glitchy size reading must not pump the zoom motor.
+        # snapshots IN THE SAME DIRECTION — one glitchy size reading must not
+        # pump the zoom motor.
+        #
+        # The direction check is the whole point and it was missing. The
+        # counter used to increment for any out-of-band reading whatever its
+        # sign, so three ticks of "face too small" followed by ONE bogus
+        # oversized reading fired a zoom OUT: a single noisy sample spent the
+        # credit the opposite direction had built up, which is precisely the
+        # failure the dwell exists to prevent. At range that is the common
+        # case, not a corner case — a barely-resolved face reports an
+        # unreliable bbox — and the resulting in/out hunting kept re-triggering
+        # autofocus, blurring the image and making recognition worse still.
+        direction = 1 if zoom_in else -1
+        if direction != self._zoom_dwell_dir:
+            self._zoom_dwell     = 0
+            self._zoom_dwell_dir = direction
         self._zoom_dwell += 1
         if self._zoom_dwell < self.ZOOM_DWELL_TICKS:
             return
@@ -731,8 +752,9 @@ class PTZController:
         self._targets.zoom     = new
         self._zoom_last_step_t = now
         self._zoom_last_move_t = now
-        self._zoom_moved_accum += abs(register_delta)
+        self._zoom_net_units   += register_delta
         self._zoom_dwell        = 0
+        self._zoom_dwell_dir    = 0
         with self._telemetry_lock:
             self._telemetry["zoom"]        = new
             self._telemetry["last_action"] = "zoom"
@@ -748,10 +770,15 @@ class PTZController:
         """Fire on_zoom_settled once the motor has been quiet for a beat
         after moving — that's when autofocus should do ONE deliberate
         re-hunt, instead of chasing the focus plane during the ramp."""
-        if (self._zoom_moved_accum and
+        # NET, not total travel. An in-then-out pair leaves the lens exactly
+        # where it started, so the focus plane never moved and re-hunting
+        # would be pure cost — and while the zoom was hunting, that cost was
+        # a blurred image, which degrades the very recognition whose failure
+        # caused the hunting in the first place.
+        if (self._zoom_net_units and
                 (now - self._zoom_last_move_t) >= self.ZOOM_SETTLE_S):
-            moved = self._zoom_moved_accum
-            self._zoom_moved_accum = 0
+            moved = abs(self._zoom_net_units)
+            self._zoom_net_units = 0
             cb = self.on_zoom_settled
             if cb:
                 try:

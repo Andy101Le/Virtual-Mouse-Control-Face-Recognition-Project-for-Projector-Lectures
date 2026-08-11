@@ -124,6 +124,12 @@ ROI_RESEARCH_SECONDS     = 1.5
 # stretched past it is still plainly theirs.
 HAND_OWNERSHIP_SLACK = 1.6
 
+# Minimum NET zoom travel, in Focuser register units, before a settled zoom
+# is worth an autofocus re-hunt. PTZController.ZOOM_STEP is 500, so this asks
+# for more than a single nudge. A real ramp accumulates several steps well
+# inside the settle window and clears this easily; an isolated nudge does not.
+ZOOM_REFOCUS_MIN_UNITS = 1000
+
 
 def hand_belongs_to_user(wrist, anchor, reach_radius, user_active):
     """
@@ -369,15 +375,22 @@ class GestureSession:
         if self.autofocus is not None:
             self.autofocus.suppress(1.2)
 
-    def _on_zoom_settled(self, _units_moved):
+    def _on_zoom_settled(self, units_moved):
         # trigger_refocus() deliberately bypasses the manual-focus guard,
         # because its original caller was the user pressing "Focus now". Wired
         # to an automatic hardware event that bypass becomes a bug: every zoom
         # step would rack the lens away from the position the user parked with
         # the slider, while the UI still reported MANUAL. Zoom moving is a
         # reason to re-focus only if focus is ours to drive.
-        if self.autofocus is not None and self.autofocus.auto_enabled:
-            self.autofocus.trigger_refocus()
+        if self.autofocus is None or not self.autofocus.auto_enabled:
+            return
+        # And only if the lens actually went somewhere. A single nudge shifts
+        # the focus plane by too little to be worth a full hunt, and hunting
+        # blurs the image while it runs — which costs recognition, which at
+        # range is what was driving the zoom around to begin with.
+        if units_moved < ZOOM_REFOCUS_MIN_UNITS:
+            return
+        self.autofocus.trigger_refocus()
 
     # ── Tracked-crop ("detector telephoto") helpers ─────────────────────────
     def _update_roi(self, cached_pose_lms, now_t):
