@@ -124,6 +124,28 @@ ROI_RESEARCH_SECONDS     = 1.5
 # stretched past it is still plainly theirs.
 HAND_OWNERSHIP_SLACK = 1.6
 
+
+def hand_belongs_to_user(wrist, anchor, reach_radius, user_active):
+    """
+    Does this hand belong to the tracked user? True when it sits within
+    arm's reach of where their face is anchored.
+
+    `anchor` must be the HELD face position, not the instantaneous one.
+    AuthManager.face_nose_pos is None on every frame the face detector came
+    up empty, and at FACE_DETECT_INTERVAL a single miss already spans about
+    three frames. Testing that directly meant a brief detection dropout
+    revoked the user's own hand mid-gesture: the cursor stopped dead and
+    then jumped to wherever the hand had travelled by the time the face
+    came back. The 10 s auth grace exists so a look-away cannot do that,
+    and the control zone holds its anchor for exactly the same reason —
+    ownership simply wasn't consulting the same judgement.
+    """
+    if not user_active or anchor is None:
+        return False
+    d = float(np.linalg.norm(np.asarray(wrist, dtype=np.float32) -
+                             np.asarray(anchor, dtype=np.float32)))
+    return d < reach_radius * HAND_OWNERSHIP_SLACK
+
 # Pose head landmarks (MediaPipe pose: 0 nose, 2/5 eyes, 7/8 ears) and the
 # factor converting their span into the face-mesh bbox diagonal that
 # get_face_size() reports. Only the ratio's rough scale matters: it exists so
@@ -807,12 +829,11 @@ class GestureSession:
                     # 20 ft — wide enough to adopt a bystander's hand — while
                     # being comparatively tight up close. Reach plus a margin
                     # is the honest bound: a hand further from you than your
-                    # own arm can stretch is not yours.
-                    own_radius = self.cursor.reach_radius * HAND_OWNERSHIP_SLACK
-                    hand_is_user = (self.auth.user_active and
-                                    self.auth.face_nose_pos is not None and
-                                    float(np.linalg.norm(
-                                        wrist - self.auth.face_nose_pos)) < own_radius)
+                    # own arm can stretch is not yours. _zone_anchor, not
+                    # auth.face_nose_pos — see hand_belongs_to_user.
+                    hand_is_user = hand_belongs_to_user(
+                        wrist, self._zone_anchor,
+                        self.cursor.reach_radius, self.auth.user_active)
 
                     if hand_is_user:
                         # Collected for the open-palm master switch below,

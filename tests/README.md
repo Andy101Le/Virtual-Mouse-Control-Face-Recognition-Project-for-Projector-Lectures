@@ -13,6 +13,7 @@ No camera, no I2C, no PTZ board — run them anywhere:
     python3 tests/test_pose_rate.py
     python3 tests/test_scene_light.py
     python3 tests/test_input_latency.py
+    python3 tests/test_tracking_dropout.py
 
 They cover the logic that is easy to get silently wrong, not the hardware
 and not SFace's own accuracy (which needs real faces to measure).
@@ -136,6 +137,18 @@ pin both ends numerically — at rest it must be within 25% of the old
 long-constant steadiness, while dragging it must have under half the old
 lag. It also checks `beta = 0` reduces exactly to a plain EMA, which is the
 documented one-constant route back to fixed-time-constant behaviour.
+
+**`test_tracking_dropout.py`** — brief face-detection gaps. A registered
+user would flick from green to red for ~0.4 s, and the cursor froze for the
+whole time and then jumped to wherever the hand had reached. Ownership was
+tested against `AuthManager.face_nose_pos`, which is `None` on any frame the
+detector came up empty — and at `FACE_DETECT_INTERVAL=3`, two consecutive
+misses is exactly the observed duration. Everything else in the system holds
+its last good value across the 10 s auth grace; ownership was the one
+consumer that didn't. The test replays that miss sequence frame by frame and
+asserts ownership never lapses. It also covers the second half — a resume
+uses a gentler time constant so the correction glides rather than teleports,
+expires on schedule, and doesn't slow down uninterrupted steering.
 
 `_hands.py` holds the synthetic hand builder shared by the gesture tests,
 so importing a helper doesn't run another suite's assertions as a side
