@@ -47,6 +47,7 @@ from face_recognizer import UNKNOWN_LABEL, FaceRecognizer
 from face_embedder import FaceEmbedder, AsyncFaceEmbedder
 from control_toggle import ControlToggle, is_toggle_pose, is_peace_sign
 from scene_light import SceneLightLog
+from latency_log import LatencyLog, boottime
 
 log = logging.getLogger(__name__)
 
@@ -173,6 +174,7 @@ class GestureSession:
         # missing or the camera is busy.
         self.cam       = None
         self.light_log = None
+        self.latency_log = None
         self.landmarks = None
         self.auth      = None
         self.gestures  = None
@@ -209,6 +211,8 @@ class GestureSession:
             self.landmarks.close()
         if getattr(self, "light_log", None):
             self.light_log.close()
+        if getattr(self, "latency_log", None):
+            self.latency_log.close()
 
     def set_suspended(self, suspended):
         """
@@ -512,7 +516,8 @@ class GestureSession:
             pose_detect_hz=POSE_DETECT_HZ,
         )
         self.cam = CameraManager(width=CAPTURE_W, height=CAPTURE_H, fps=30)
-        self.light_log = SceneLightLog()
+        self.light_log   = SceneLightLog()
+        self.latency_log = LatencyLog()
 
         # Face identity. One embedding costs ~56 ms, so live recognition runs
         # on a worker thread and the loop consumes whatever it last published;
@@ -582,6 +587,13 @@ class GestureSession:
 
         while self._running:
             ok, frame = self.cam.read()
+            # Both clocks, taken together: perf_counter drives every interval
+            # below, while boottime is the only one comparable to the camera's
+            # SensorTimestamp. Reading them apart would smear the difference
+            # into the driver latency figure.
+            read_t   = time.perf_counter()
+            read_bt  = boottime() if self.latency_log is not None and \
+                                     self.latency_log.enabled else None
             if not ok:
                 time.sleep(0.01)
                 continue
@@ -634,6 +646,11 @@ class GestureSession:
             (h_result, cached_face_lms,
              cached_pose_lms, face_updated) = self.landmarks.detect(
                 mp_image, frame_n, ts_ms, transform=transform)
+            detect_t = time.perf_counter()
+
+            # Cleared per frame so the latency log can tell "this frame drove
+            # the cursor" from "this frame ran but steered nothing".
+            self.cursor.last_move_sent_t = None
 
             if face_updated:
                 # Identity runs off-thread. Submit this frame's faces, then
@@ -744,10 +761,10 @@ class GestureSession:
                 else:
                     det_bounds = None
                 self.cursor.set_control_zone(self._zone_anchor, self._zone_size,
-                                             detect_window=det_bounds)
+                                             dt, detect_window=det_bounds)
             else:
                 self._zone_anchor = self._zone_size = None
-                self.cursor.set_control_zone(None, None)
+                self.cursor.set_control_zone(None, None, dt)
             # Keep the display crop honest about what has to stay visible.
             self.zoom.set_control_zone(self.cursor.zone)
 
@@ -774,13 +791,14 @@ class GestureSession:
             # frame — first MOVE hand in detection order claims it, so two
             # open palms don't yank the pointer back and forth.
             move_claimed = False
+            move_action  = ""
             user_hand_pts = []
             if h_result.hand_landmarks:
                 for hand_id, hand in enumerate(h_result.hand_landmarks):
                     wrist   = np.array([hand[0].x, hand[0].y], dtype=np.float32)
                     raw_pts = np.array([[lm.x, lm.y, lm.z] for lm in hand],
                                        dtype=np.float32)
-                    sxyz = self.gestures.smooth_hand(hand_id, raw_pts)
+                    sxyz = self.gestures.smooth_hand(hand_id, raw_pts, dt)
                     sp   = (sxyz[:, :2] * (pw, ph)).astype(np.int32)
 
                     # "Is this hand the tracked user's?" scales with how big
@@ -806,7 +824,12 @@ class GestureSession:
                     self.hud.draw_hand(display, FINGER_CHAINS, sp,
                                        line_col, dot_col, zoom=self.zoom)
 
-                    confirmed, confidence = self.gestures.classify(hand_id, sxyz)
+                    confirmed, confidence, raw = self.gestures.classify(
+                        hand_id, sxyz)
+                    # A click pose STARTING is enough to hold the cursor —
+                    # waiting for confirmation lets the pointer follow the
+                    # hand as it curls into the gesture. See classify().
+                    settling_to_click = raw in CURSOR_FREEZE_ACTIONS
 
                     if not hand_is_user:                     col = (0, 0, 200)
                     elif confirmed == 'NO ACTION':           col = (120, 120, 120)
@@ -842,10 +865,11 @@ class GestureSession:
                     if (hand_is_user and self.control_toggle.enabled
                             and not talking_to_switch):
                         if confirmed == 'MOVE':
-                            if not move_claimed:
+                            if not move_claimed and not settling_to_click:
                                 move_claimed = True
+                                move_action  = confirmed
                                 self.cursor.handle_action(confirmed, hand_id,
-                                                          sxyz[8, :2])
+                                                          sxyz[8, :2], dt)
                                 self.hud.draw_move_indicator(
                                     display, tip_px, self.auth.limb_mode,
                                     self.auth.face_nose_pos, pw, ph, zoom=self.zoom)
@@ -854,7 +878,7 @@ class GestureSession:
                             # per-hand cooldowns in the cursor controller
                             # keep them from double-firing.
                             self.cursor.handle_action(confirmed, hand_id,
-                                                      sxyz[8, :2])
+                                                      sxyz[8, :2], dt)
                     elif not hand_is_user:
                         self.hud.draw_blocked_hand(display, tip_px, zoom=self.zoom)
 
@@ -883,6 +907,21 @@ class GestureSession:
             self.hud.draw_control_switch(display, self.control_toggle, pw, ph)
             self.ptz.draw_debug_hud(display)
             display = self.zoom.draw_debug(display)
+
+            # ── Latency sample ─────────────────────────────────────────────
+            # Taken BEFORE the preview encode: the cursor report has already
+            # gone out by this point, and charging it for JPEG work that
+            # happens afterwards would overstate the number being tuned.
+            if self.latency_log is not None and self.latency_log.enabled:
+                self.latency_log.maybe_log(
+                    now_t,
+                    frame_n=frame_n, fps=self.fps, dt=dt,
+                    driver_ms=LatencyLog.sensor_age_ms(
+                        self.cam.last_metadata, read_bt),
+                    read_t=read_t, detect_t=detect_t,
+                    sent_t=self.cursor.last_move_sent_t,
+                    action=move_action,
+                )
 
             # ── Push preview to the browser (rate-limited) ──────────────────
             if (now_t - last_preview_t) >= (1.0 / PREVIEW_FPS):

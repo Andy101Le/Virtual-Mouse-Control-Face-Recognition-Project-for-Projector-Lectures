@@ -27,12 +27,45 @@ KEY DIFFERENCE FROM THE PYAUTOGUI VERSION
 import time
 import numpy as np
 
+from smoothing import ema_alpha, OneEuroFilter
+
 
 class BTCursorController:
     # Fallback control zone, used only when nobody is tracked and there is
     # therefore no measured body scale to work from.
     CAM_MARGIN     = 0.15
-    CURSOR_SMOOTH  = 0.35
+    # Speed-adaptive pointer smoothing. A single time constant was the wrong
+    # shape for this: at 0.18 s precise pointing was lovely and everything
+    # lagged; at 0.045 s it was responsive and shivered when you held still
+    # trying to click something small. Those are the same knob pulling both
+    # ways, so the knob is gone — see smoothing.OneEuroFilter.
+    #
+    # MIN_CUTOFF is what you feel while lining up a click. 0.9 Hz is a
+    # ~0.18 s time constant, i.e. deliberately matched to the old smoothing
+    # that felt right for precision work; lower it if the pointer still
+    # shivers on small targets.
+    #
+    # BETA is how readily it sharpens as your hand speeds up. Raise it if
+    # large sweeps feel sluggish, lower it if fast movement feels loose.
+    # BETA = 0 turns this back into exactly the old fixed EMA.
+    CURSOR_MIN_CUTOFF_HZ = 0.9
+    CURSOR_BETA          = 2.0
+    CURSOR_D_CUTOFF_HZ   = 1.0
+
+    # Reacquisition. Whenever steering stops and restarts — the hand left the
+    # frame, the gesture changed, tracking dropped — the filter still holds
+    # the position from before the gap while the hand has moved on. At
+    # full speed that gap is closed in about two frames, which reads as the
+    # cursor teleporting rather than moving.
+    #
+    # So the first moments after a resume are deliberately slower: a longer
+    # time constant turns the correction into a visible glide. This is the one
+    # place where MORE lag is the better answer, because what is being
+    # corrected is not a real hand movement and should not look like one.
+    REACQUIRE_GAP_S = 0.25    # a pause longer than this counts as a resume
+    REACQUIRE_S     = 0.35    # how long the gentler constant stays in force
+    REACQUIRE_TAU_S = 0.25
+
     CLICK_COOLDOWN = 2.0
     SCROLL_COOLDOWN = 1.2
     SCROLL_CLICKS   = 3     # wheel notches per ZOOM IN / ZOOM OUT gesture
@@ -93,8 +126,12 @@ class BTCursorController:
     # Absolute floor, for when nobody is tracked and there is no face_size.
     EDGE_INSET   = 0.02
     MIN_HALF     = 0.06
-    ZONE_SMOOTH  = 0.15     # EMA so the zone glides as you move rather than
-                            # snapping and dragging the cursor with it
+    # EMA so the zone glides as you move rather than snapping and dragging
+    # the cursor with it. Deliberately slow, and tuned to reproduce the old
+    # alpha=0.15 behaviour at ~13 fps — this one is not in the latency path
+    # and does not want sharpening; it is time-based only so it stops
+    # changing character with frame rate.
+    ZONE_TAU_S   = 0.47
 
     def __init__(self, hid_device):
         """hid_device: a started BluetoothHIDDevice."""
@@ -120,12 +157,29 @@ class BTCursorController:
         self._peace_since   = {}
         self._peace_latched = {}
 
+        # perf_counter at which the most recent MOVE report was handed to
+        # the radio. Read by the latency log; None until one is sent.
+        self.last_move_sent_t = None
+
+        # Reacquisition state. -inf rather than 0.0 so the very first MOVE
+        # after startup counts as a resume and eases in, instead of yanking
+        # the cursor from the centre of the screen to wherever the hand is.
+        self._last_move_t     = float("-inf")
+        self._reacquire_until = float("-inf")
+
+        self._fx = OneEuroFilter(self.CURSOR_MIN_CUTOFF_HZ, self.CURSOR_BETA,
+                                 self.CURSOR_D_CUTOFF_HZ)
+        self._fy = OneEuroFilter(self.CURSOR_MIN_CUTOFF_HZ, self.CURSOR_BETA,
+                                 self.CURSOR_D_CUTOFF_HZ)
+
     # ── Control zone ────────────────────────────────────────────────────────
-    def set_control_zone(self, anchor, face_size, detect_window=None):
+    def set_control_zone(self, anchor, face_size, dt, detect_window=None):
         """
         Resize/reposition the control zone for the tracked user. Call once
         per frame with their nose position and face size (both normalized),
         or with None to fall back to the fixed box.
+
+        dt: seconds since the previous frame, for the zone's glide filter.
 
         detect_window: (x0, y0, x1, y1) normalized bounds of the region
         MediaPipe is actually looking at this frame, when the detector
@@ -137,7 +191,7 @@ class BTCursorController:
         if anchor is None or not face_size:
             self._have_scale = False
             m = self.CAM_MARGIN
-            self._blend_zone((m, m, 1.0 - m, 1.0 - m))
+            self._blend_zone((m, m, 1.0 - m, 1.0 - m), dt)
             return
 
         fs = float(face_size)
@@ -185,10 +239,10 @@ class BTCursorController:
         cy = min(max(cy, by0 + up),     by1 - down)
 
         self._have_scale = True
-        self._blend_zone((cx - half_w, cy - up, cx + half_w, cy + down))
+        self._blend_zone((cx - half_w, cy - up, cx + half_w, cy + down), dt)
 
-    def _blend_zone(self, target):
-        a = self.ZONE_SMOOTH
+    def _blend_zone(self, target, dt):
+        a = ema_alpha(dt, self.ZONE_TAU_S)
         self.zone = tuple(z + a * (t - z) for z, t in zip(self.zone, target))
 
     @property
@@ -252,10 +306,11 @@ class BTCursorController:
         self._last_click_time[hand_id] = now_t
         return True
 
-    def handle_action(self, confirmed, hand_id, tip_xy):
+    def handle_action(self, confirmed, hand_id, tip_xy, dt):
         """
         confirmed: debounced gesture label ('MOVE', 'LEFT CLICK', ...)
         tip_xy:    normalized (x, y) fingertip position, used for MOVE.
+        dt:        seconds since the previous frame, for the pointer filter.
 
         No-ops safely when no host is connected, so the gesture pipeline
         can keep running (and previewing) before anything is paired.
@@ -269,9 +324,31 @@ class BTCursorController:
 
         if confirmed == 'MOVE':
             tgt_x, tgt_y = self.absolute_to_screen(float(tip_xy[0]), float(tip_xy[1]))
-            self.cursor_nx += self.CURSOR_SMOOTH * (tgt_x - self.cursor_nx)
-            self.cursor_ny += self.CURSOR_SMOOTH * (tgt_y - self.cursor_ny)
+
+            if (now - self._last_move_t) > self.REACQUIRE_GAP_S:
+                # Reseed rather than let the filters see the gap as movement:
+                # a large jump after a pause would read as enormous speed,
+                # open One Euro's cutoff wide, and teleport the pointer.
+                self._reacquire_until = now + self.REACQUIRE_S
+                self._fx.reset(self.cursor_nx)
+                self._fy.reset(self.cursor_ny)
+            self._last_move_t = now
+
+            if now < self._reacquire_until:
+                # Easing back in after a gap — a fixed, gentle constant, so
+                # the correction glides instead of snapping. See REACQUIRE_S.
+                a = ema_alpha(dt, self.REACQUIRE_TAU_S)
+                self.cursor_nx += a * (tgt_x - self.cursor_nx)
+                self.cursor_ny += a * (tgt_y - self.cursor_ny)
+                self._fx.reset(self.cursor_nx)
+                self._fy.reset(self.cursor_ny)
+            else:
+                self.cursor_nx = self._fx(tgt_x, dt)
+                self.cursor_ny = self._fy(tgt_y, dt)
             self.hid.move_absolute(self.cursor_nx, self.cursor_ny)
+            # Stamped AFTER the report is on the wire, so the latency log
+            # measures the whole path rather than stopping at our own code.
+            self.last_move_sent_t = time.perf_counter()
 
         elif confirmed == 'LEFT CLICK':
             if (now - self._last_click_time[hand_id]) > self.CLICK_COOLDOWN:

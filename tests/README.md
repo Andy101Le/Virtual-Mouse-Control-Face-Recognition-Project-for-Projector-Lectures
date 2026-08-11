@@ -12,6 +12,7 @@ No camera, no I2C, no PTZ board — run them anywhere:
     python3 tests/test_gesture_mlp.py
     python3 tests/test_pose_rate.py
     python3 tests/test_scene_light.py
+    python3 tests/test_input_latency.py
 
 They cover the logic that is easy to get silently wrong, not the hardware
 and not SFace's own accuracy (which needs real faces to measure).
@@ -111,6 +112,30 @@ centred so a side-lit face isn't read from its dark half, a bystander not
 capturing the measurement, and the logger's two behaviours: rate-limiting
 redundant samples, and forcing a row the instant a face or the auth state is
 lost, which is the row worth having.
+
+**`test_input_latency.py`** — input responsiveness. The smoothing filters
+were written as fixed per-frame weights, so the lag they added was measured
+in frames rather than seconds: the cursor got laggier exactly when the
+pipeline was busiest, and every performance regression quietly became a
+responsiveness regression. The test pins the new time-based filters to their
+exact continuous form (the gap left after *t* seconds is `exp(-t/tau)`
+however that time was chopped into frames), and shows the old fixed weight
+demonstrably lacked that property. Also covers the asymmetric debounce —
+MOVE confirms in two frames, everything that actuates keeps the full five,
+and `NO ACTION` deliberately stays slow because it is the label that *stops*
+the cursor — plus the latency log's breakdown, its rate limiting, and its
+refusal to invent a driver figure when the camera reports no
+`SensorTimestamp`.
+
+The latency file also covers the pointer's *feel*, which is a separate
+axis from its lag. A single time constant could not serve both: long made
+precise pointing steady and everything laggy, short made it responsive and
+made the pointer shiver while lining up a small target. The cursor now uses
+a One Euro filter, which varies its cutoff with hand speed, and the tests
+pin both ends numerically — at rest it must be within 25% of the old
+long-constant steadiness, while dragging it must have under half the old
+lag. It also checks `beta = 0` reduces exactly to a plain EMA, which is the
+documented one-constant route back to fixed-time-constant behaviour.
 
 `_hands.py` holds the synthetic hand builder shared by the gesture tests,
 so importing a helper doesn't run another suite's assertions as a side

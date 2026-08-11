@@ -19,11 +19,17 @@ class FakeHID:
     connected = False
 
 
+# Nominal frame time. The zone filter is time-based now, so its calls need
+# one; the exact value doesn't matter here because these helpers iterate to
+# convergence.
+DT = 1.0 / 13.0
+
+
 def settled(face_size, anchor=(0.5, 0.45), detect_window=None):
     """A controller whose zone EMA has converged for this apparent size."""
     c = BC(FakeHID())
     for _ in range(400):
-        c.set_control_zone(anchor, face_size, detect_window=detect_window)
+        c.set_control_zone(anchor, face_size, DT, detect_window=detect_window)
     return c
 
 
@@ -171,7 +177,7 @@ print()
 print("== untracked user falls back to the fixed zone ==")
 c = settled(0.08)
 for _ in range(400):
-    c.set_control_zone(None, None)
+    c.set_control_zone(None, None, DT)
 m = BC.CAM_MARGIN
 assert all(abs(a - b) < 1e-3 for a, b in zip(c.zone, (m, m, 1 - m, 1 - m))), c.zone
 assert not c._have_scale
