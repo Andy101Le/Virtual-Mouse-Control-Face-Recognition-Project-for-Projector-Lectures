@@ -195,6 +195,46 @@ function reflectControls(t) {
 
 socket.on("controls_toggled", reflectControls);
 
+/* ── Cursor control ownership ────────────────────────────────────────────
+   One camera, one Bluetooth radio: exactly one machine can hold the cursor.
+   The server broadcasts every change, so a second device watching this same
+   account sees the handoff without a refresh. */
+function paintControl(state) {
+  const label = $("control-holder");
+  if (!label) return;
+  const h = state.holder;
+  const release = $("control-release");
+  const mine = h && h.sid === socket.id;
+
+  if (!h) {
+    label.textContent = state.hid_peer
+      ? "Unclaimed — the cursor is going to " + state.hid_peer + "."
+      : "Unclaimed — no computer is connected.";
+    label.className = "empty";
+  } else if (mine) {
+    label.textContent = "You have control on this device (" + h.mac + ").";
+    label.className = "";
+  } else {
+    label.textContent =
+      h.user + " has control on " + (h.name || h.mac) + ".";
+    label.className = "";
+  }
+  if (release) release.hidden = !h;
+}
+
+socket.on("control_changed", paintControl);
+
+if ($("control-take")) {
+  $("control-take").onclick = () =>
+    post("/api/control/take", { mac: $("control-mac").value, sid: socket.id })
+      .then(paintControl)
+      .catch(alertErr);
+}
+if ($("control-release")) {
+  $("control-release").onclick = () =>
+    post("/api/control/release", {}).then(paintControl).catch(alertErr);
+}
+
 /* ── Digital auto-zoom ───────────────────────────────────────────────── */
 $("digizoom").oninput = () =>
   ($("digizoom-val").textContent = Number($("digizoom").value).toFixed(1) + "×");

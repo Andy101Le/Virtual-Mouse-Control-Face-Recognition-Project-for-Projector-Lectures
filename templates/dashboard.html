@@ -191,6 +191,32 @@
   </div>
 
   <div class="panel">
+    <h2>Cursor control</h2>
+    <p id="control-holder" class="empty">Checking…</p>
+    {% if devices %}
+      <p style="font-size:.88rem;color:var(--ink-muted)">
+        Your browser can't tell which computer it's running on, so pick the
+        one you're sitting at.
+      </p>
+      <div style="display:flex;gap:.5rem;margin-top:.75rem">
+        <select id="control-mac" style="flex:1">
+          {% for d in devices %}
+          <option value="{{ d.mac }}">{{ d.name or 'Paired computer' }} — {{ d.mac }}</option>
+          {% endfor %}
+        </select>
+        <button id="control-take">Take control</button>
+      </div>
+      <button class="secondary" id="control-release" hidden
+              style="margin-top:.5rem">Release control</button>
+    {% else %}
+      <p style="font-size:.88rem;color:var(--ink-muted)">
+        Pair a computer first — the cursor goes to whichever paired machine
+        holds control.
+      </p>
+    {% endif %}
+  </div>
+
+  <div class="panel">
     <h2>Your face</h2>
     {% if has_face %}
       <p style="font-size:.88rem">

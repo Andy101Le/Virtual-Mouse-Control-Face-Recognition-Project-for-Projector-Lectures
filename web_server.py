@@ -30,7 +30,7 @@ import functools
 import logging
 import os
 import secrets
-import threading
+import uuid
 
 from flask import (Flask, render_template, request, redirect, url_for,
                    session, jsonify, flash)
@@ -42,6 +42,7 @@ from bluetooth_manager import BluetoothManager, PairingState
 from ptz_controller import PTZController
 from ptz_manual import ManualPTZ, MODE_AUTO, MODE_MANUAL
 from gesture_session import GestureSession
+from control_registry import ControlRegistry
 
 logging.basicConfig(level=logging.INFO,
 
@@ -84,12 +85,18 @@ gesture = GestureSession(db, hid, ptz, socketio)
 
 # ── Auth helpers ────────────────────────────────────────────────────────────
 # Sessions live in a signed cookie, so the server can't delete them when the
-# user simply closes the site. Instead each username has a sign-out epoch:
-# login stamps the current epoch into the cookie, and closing the last
-# dashboard tab bumps it, which retroactively invalidates every cookie that
-# user already holds. In-memory on purpose — after a server restart the
-# epoch resets to 0 and old cookies (epoch >= 0) stay valid, preserving the
-# existing sessions-survive-a-restart behaviour.
+# user simply closes the site. Instead each login gets a device_id and a
+# sign-out epoch: login stamps the current epoch into the cookie, and closing
+# the last dashboard tab on THAT device bumps it, which retroactively
+# invalidates the cookie sitting in that browser. In-memory on purpose —
+# after a server restart the epoch resets to 0 and old cookies (epoch >= 0)
+# stay valid, preserving the existing sessions-survive-a-restart behaviour.
+#
+# Keyed by device_id, not username: the same account is routinely open on a
+# laptop and a desktop at once, and closing the laptop tab must not sign the
+# desktop out from under the presenter. That means one entry per login rather
+# than one per account, so this grows with use — a few dozen bytes each, and
+# a server restart clears it, which is well within scale for one classroom Pi.
 _signout_epoch = {}
 
 
@@ -97,7 +104,9 @@ def _session_valid():
     user = session.get("user")
     if user is None:
         return False
-    if session.get("epoch", 0) < _signout_epoch.get(user, 0):
+    # Cookies issued before device_ids existed have no key here and read 0,
+    # so they stay valid until their next login upgrades them.
+    if session.get("epoch", 0) < _signout_epoch.get(session.get("device_id"), 0):
         session.clear()   # cookie predates a close-tab sign-out — kill it
         return False
     return True
@@ -149,10 +158,12 @@ def login():
         password = request.form.get("password", "")
         row = db.check_login(username, password)
         if row:
-            session["user"]     = row["username"]
-            session["is_admin"] = bool(row["is_admin"])
-            session["epoch"]    = _signout_epoch.get(row["username"], 0)
-            gesture.set_active_user(row["username"])
+            session["user"]      = row["username"]
+            session["is_admin"]  = bool(row["is_admin"])
+            # A fresh device_id per login: this browser's sign-out state is
+            # its own, independent of the same account on another machine.
+            session["device_id"] = uuid.uuid4().hex
+            session["epoch"]     = 0
             return redirect(request.args.get("next") or url_for("dashboard"))
         flash("That username and password don't match an account.", "error")
 
@@ -183,10 +194,13 @@ def signup():
 
 @app.route("/logout")
 def logout():
-    # Stop following the person who just signed out IMMEDIATELY — the
-    # recogniser forgets its target, so tracking/gestures stop even if a
-    # stale dashboard tab is still streaming the preview somewhere.
-    gesture.set_active_user(None)
+    # Scoped to THIS browser: drop its sockets and release the cursor if it
+    # held it, then re-derive who the camera follows. Clearing the tracked
+    # user outright (the old behaviour) stranded every other device on the
+    # same account — they stayed connected and authenticated, but the
+    # recogniser had been rebuilt to match nobody, so gestures silently died
+    # with no way to recover short of a page refresh.
+    _forget_device(session.get("device_id"))
     session.clear()
     return redirect(url_for("login"))
 
@@ -195,9 +209,13 @@ def logout():
 @login_required
 def dashboard():
     user = current_user()
-    # Re-sync the tracker's target in case this is a session restored after a
-    # server restart (login POST wouldn't have run). Idempotent when unchanged.
-    gesture.set_active_user(user)
+    # A session restored from a pre-device_id cookie (or from before a server
+    # restart) needs an identity before it can own control or sign itself out.
+    if not session.get("device_id"):
+        session["device_id"] = uuid.uuid4().hex
+        session["epoch"] = 0   # brand-new id, so nothing can have revoked it
+    # Tracking is (re-)armed by the socket connect this page is about to make,
+    # which is also what decides who holds the cursor.
     return render_template(
         "dashboard.html",
         user=user,
@@ -335,7 +353,50 @@ def bt_forget():
         return jsonify(error="That device belongs to another account."), 403
     btmgr.remove_device(mac)
     db.remove_bt_device(mac)
+    control.drop_mac(mac)
     return jsonify(ok=True)
+
+
+# ── Cursor control ownership ────────────────────────────────────────────────
+@app.get("/api/control")
+@login_required
+def control_status():
+    return jsonify(_control_payload())
+
+
+@app.post("/api/control/take")
+@login_required
+def control_take():
+    """
+    Claim the cursor for one specific paired machine. The browser can't
+    discover its own Bluetooth MAC, so the machine is named explicitly from
+    the caller's paired list rather than inferred from the connection.
+    """
+    mac = (request.json.get("mac") or "").upper()
+    if not mac:
+        return jsonify(error="Pick which computer you're sitting at."), 400
+
+    owner = db.get_bt_device_owner(mac)
+    if owner is None:
+        return jsonify(error="That computer isn't paired."), 404
+    if owner != current_user() and not session.get("is_admin"):
+        return jsonify(error="That computer belongs to another account."), 403
+
+    name = next((d["name"] for d in db.get_bt_devices() if d["mac"] == mac), None)
+    control.take(request.json.get("sid"), current_user(),
+                 session.get("device_id"), mac, name)
+    return jsonify(_control_payload())
+
+
+@app.post("/api/control/release")
+@login_required
+def control_release():
+    holder = control.holder
+    if holder is not None and holder["user"] != current_user() \
+            and not session.get("is_admin"):
+        return jsonify(error="Someone else holds control."), 403
+    control.release("released from the dashboard")
+    return jsonify(_control_payload())
 
 
 # ── PTZ + zoom API ──────────────────────────────────────────────────────────
@@ -548,49 +609,72 @@ def admin_reset():
     return jsonify(ok=True)
 
 
-# ── Socket.IO ───────────────────────────────────────────────────────────────
+# ── Socket.IO, presence and control ownership ───────────────────────────────
 # Presence gating: the dashboard holds a Socket.IO connection whenever a
 # logged-in tab is open, so "zero authenticated sockets" == "nobody is
 # using the system" — and the detection pipeline suspends (no tracking,
 # no gestures, no cursor) until someone comes back. The grace period
 # keeps a page refresh or the pairing flow's location.reload() from
 # bouncing the pipeline.
+#
+# Control ownership lives in control_registry.py — see there for why it is
+# scoped per device rather than per account.
 VIEWER_GRACE_S = 10.0
-_viewers      = set()
-_viewer_lock  = threading.Lock()
+
+control = ControlRegistry(
+    on_active_user=lambda u: gesture.set_active_user(u),
+    on_preferred_peer=lambda m: hid.set_preferred_peer(m),
+    on_broadcast=lambda: socketio.emit("control_changed", _control_payload()),
+)
+
+
+def _control_payload():
+    return {"holder": control.holder, "hid_peer": hid.peer_address}
+
+
+def _forget_device(device_id):
+    """Sign one browser out: drop its viewers and its claim on the cursor,
+    then kill the cookie still sitting in it."""
+    control.forget_device(device_id)
+    if device_id is not None:
+        _signout_epoch[device_id] = _signout_epoch.get(device_id, 0) + 1
 
 
 def _suspend_if_no_viewers():
     socketio.sleep(VIEWER_GRACE_S)
-    with _viewer_lock:
-        if _viewers:
-            return
-    # Closing the last dashboard tab IS a sign-out, not a pause: forget the
-    # tracked user exactly like /logout does, and bump their epoch so the
-    # cookie still sitting in their browser is dead — reopening the site
-    # lands on the login page instead of silently resuming tracking.
-    user = gesture.active_user
-    if user is not None:
-        _signout_epoch[user] = _signout_epoch.get(user, 0) + 1
-        gesture.set_active_user(None)
-        log.info("Last dashboard tab closed — signed out '%s'", user)
-    gesture.set_suspended(True)
+    if not control.any_viewers():
+        gesture.set_suspended(True)
+
+
+def _sign_out_device_if_gone(device_id):
+    """
+    A device's last tab closing IS a sign-out, not a pause — but only after
+    the grace period, so a refresh or the pairing flow's location.reload()
+    doesn't count.
+    """
+    socketio.sleep(VIEWER_GRACE_S)
+    if control.has_device(device_id):
+        return   # came back (refresh) — still signed in
+    log.info("Last dashboard tab closed on device %s — signed out", device_id)
+    _forget_device(device_id)
 
 
 @socketio.on("connect")
 def on_connect():
     if not _session_valid():
         return False   # reject unauthenticated / signed-out socket connections
-    with _viewer_lock:
-        _viewers.add(request.sid)
+    control.add_viewer(request.sid, session.get("user"),
+                       session.get("device_id"))
     gesture.set_suspended(False)
     socketio.emit("telemetry", gesture.telemetry())
+    socketio.emit("control_changed", _control_payload(), to=request.sid)
 
 
 @socketio.on("disconnect")
 def on_disconnect():
-    with _viewer_lock:
-        _viewers.discard(request.sid)
+    device_id = control.remove_viewer(request.sid)
+    if device_id is not None:
+        socketio.start_background_task(_sign_out_device_if_gone, device_id)
     socketio.start_background_task(_suspend_if_no_viewers)
 
 

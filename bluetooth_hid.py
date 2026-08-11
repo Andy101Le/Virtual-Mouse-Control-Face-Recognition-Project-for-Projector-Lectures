@@ -295,6 +295,14 @@ class BluetoothHIDDevice:
         self._reconnect_targets = None
         self._lock = threading.Lock()
 
+        # Which host is allowed to hold the HID link. None = the original
+        # free-for-all: accept whoever dials in, and dial every paired host
+        # until one answers. Once the dashboard hands control to a specific
+        # machine this is that machine's MAC, and every other host is
+        # refused — otherwise the accept loop would happily let an idle
+        # second PC steal the cursor back the moment it woke up.
+        self._preferred_mac = None
+
         # Cached pointer state — every report must carry the full state,
         # since HID reports are absolute snapshots, not diffs.
         self._x = 0
@@ -418,11 +426,29 @@ class BluetoothHIDDevice:
                     log.exception("HID accept failed")
                 return
 
+            peer = ctrl_info[0]
             with self._lock:
-                self._ctrl_conn = ctrl_conn
-                self._intr_conn = intr_conn
-                self._peer_addr = ctrl_info[0]
-            log.info("HID host connected: %s", self._peer_addr)
+                pref = self._preferred_mac
+                refuse = not self._peer_allowed(peer)
+                if not refuse:
+                    self._ctrl_conn = ctrl_conn
+                    self._intr_conn = intr_conn
+                    self._peer_addr = peer
+
+            if refuse:
+                # Not the machine that holds control. Hang up rather than
+                # serve it — a sleeping PC that reconnects on wake must not
+                # silently take the cursor away from the active presenter.
+                log.info("HID connection from %s refused — %s holds control",
+                         peer, pref)
+                for s in (ctrl_conn, intr_conn):
+                    try:
+                        s.close()
+                    except OSError:
+                        pass
+                continue
+
+            log.info("HID host connected: %s", peer)
 
     def _reconnect_loop(self):
         """
@@ -441,17 +467,35 @@ class BluetoothHIDDevice:
         import time
         while self._running:
             if not self.connected:
-                try:
-                    targets = list(self._reconnect_targets() or [])
-                except Exception:
-                    log.exception("reconnect target lookup failed")
-                    targets = []
-                for mac in targets:
+                for mac in self._dial_targets():
                     if not self._running or self.connected:
                         break
                     if self._connect_to_host(mac):
                         break
             time.sleep(self.RECONNECT_INTERVAL_S)
+
+    def _peer_allowed(self, mac):
+        """May this host hold the HID link? Everything is allowed until the
+        dashboard pins control to one machine. Caller holds the lock."""
+        return (self._preferred_mac is None
+                or (mac or "").upper() == self._preferred_mac)
+
+    def _dial_targets(self):
+        """Which hosts the reconnect loop should try, in order."""
+        with self._lock:
+            pref = self._preferred_mac
+        if pref is not None:
+            # Someone holds control: dial only their machine. Dialing the
+            # whole paired list here would reconnect the wrong PC and undo
+            # the handoff a few seconds after it happened.
+            return [pref]
+        if self._reconnect_targets is None:
+            return []
+        try:
+            return list(self._reconnect_targets() or [])
+        except Exception:
+            log.exception("reconnect target lookup failed")
+            return []
 
     def _connect_to_host(self, mac):
         """Dial one host: control channel first, then interrupt, per the
@@ -479,9 +523,11 @@ class BluetoothHIDDevice:
         ctrl.settimeout(None)
         intr.settimeout(None)
         with self._lock:
-            if self._intr_conn is not None:
-                # Host beat us to it via the accept loop while we were
-                # dialing — keep that connection, drop ours.
+            if self._intr_conn is not None or not self._peer_allowed(mac):
+                # Either the host beat us to it via the accept loop while we
+                # were dialing — keep that connection, drop ours — or control
+                # moved to a different machine mid-dial, which makes this
+                # connection stale before it was ever used.
                 for s in (ctrl, intr):
                     try:
                         s.close()
@@ -503,6 +549,45 @@ class BluetoothHIDDevice:
     def peer_address(self):
         with self._lock:
             return self._peer_addr
+
+    @property
+    def preferred_peer(self):
+        with self._lock:
+            return self._preferred_mac
+
+    def set_preferred_peer(self, mac):
+        """
+        Point the HID link at one specific paired host, dropping whatever
+        host holds it now. Pass None to release the pin and go back to
+        accepting/dialing any paired machine.
+
+        Returns immediately: the actual dial runs on a background thread
+        because _connect_to_host blocks for up to two 5 s socket timeouts,
+        and this is called from a web request handler.
+        """
+        mac = mac.upper() if mac else None
+        with self._lock:
+            if mac == self._preferred_mac:
+                return
+            self._preferred_mac = mac
+            stale = (self._peer_addr is not None
+                     and mac is not None
+                     and self._peer_addr.upper() != mac)
+            if stale:
+                for s in (self._intr_conn, self._ctrl_conn):
+                    if s is not None:
+                        try:
+                            s.close()
+                        except OSError:
+                            pass
+                self._ctrl_conn = self._intr_conn = None
+                self._peer_addr = None
+
+        if stale:
+            log.info("HID link released — control moved to %s", mac)
+        if mac is not None and self._running:
+            threading.Thread(target=self._connect_to_host, args=(mac,),
+                             daemon=True).start()
 
     # ── Report sending ──────────────────────────────────────────────────────
     def _send_report(self, report):

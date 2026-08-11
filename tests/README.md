@@ -12,6 +12,8 @@ No camera, no I2C, no PTZ board — run them anywhere:
     python3 tests/test_gesture_mlp.py
     python3 tests/test_pose_rate.py
     python3 tests/test_scene_light.py
+    python3 tests/test_control_registry.py
+    python3 tests/test_hid_preferred_peer.py
     python3 tests/test_input_latency.py
     python3 tests/test_tracking_dropout.py
     python3 tests/test_zoom_stability.py
@@ -114,6 +116,27 @@ centred so a side-lit face isn't read from its dark half, a bystander not
 capturing the measurement, and the logger's two behaviours: rate-limiting
 redundant samples, and forcing a row the instant a face or the auth state is
 lost, which is the row worth having.
+
+**`test_control_registry.py`** — who holds the cursor when one account is
+signed in on two machines, which is the normal case for a presenter (the
+lecture PC plus their own laptop). Carries a regression for the reported
+bug: signing out on the device holding the cursor used to leave every other
+session on that account connected and authenticated but silently dead,
+because the recogniser had been retargeted to nobody and nothing re-armed
+it. Also covers the unclaimed fallback to the newest viewer (so a
+one-machine user never has to press anything), an explicit claim outranking
+a newer viewer, handoff between devices, control surviving a page refresh —
+a refresh disconnects, and yanking the cursor away in that window would make
+the dashboard unusable — and release on unpairing the controlling machine.
+
+**`test_hid_preferred_peer.py`** — the other half: pinning the Bluetooth
+link to one host is what makes a handoff stick. Before pinning, who held
+the cursor was a race between the accept loop and the reconnect loop, and
+logging in had no say in it. Checks that pinning refuses every other host
+(so a sleeping PC can't take the cursor back on wake), that the reconnect
+loop stops dialling the whole paired list while pinned, that moving the pin
+drops the stale link while re-pinning the same machine doesn't bounce it,
+and that releasing the pin doesn't hang up on the machine in use.
 
 **`test_input_latency.py`** — input responsiveness. The smoothing filters
 were written as fixed per-frame weights, so the lag they added was measured
